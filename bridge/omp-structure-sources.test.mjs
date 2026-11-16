@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { cp, mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, linkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { architectIdentity, registerClassifyTool } from './omp-architect.mjs';
 import { controlAllowed } from './omp-manager.mjs';
 import { ACTIONS, MAX_MEMORY, MAX_SOURCE_BYTES, PAGE_BYTES, bunLocalResolver, createStructureSources, localPasteReferences, markdownLike, registerStructureSources } from './omp-structure-sources.mjs';
+import { prepareSdkNatives } from './fixtures/sdk-natives.mjs';
 
 const ENV = { OMP_MANAGER_BRIDGE_TOKEN: 'token', OMP_MANAGER_BRIDGE_INSTANCE_ID: 'architect-1', OMP_MANAGER_BRIDGE_GENERATION: '4' };
 const sha = value => createHash('sha256').update(value).digest('hex');
@@ -433,9 +434,7 @@ test('installed SDK local:// resolver backs a real session paste file and the ca
   const root = await mkdtemp(path.join(os.homedir(), '.omp-structure-sdk-'));
   try {
     await mkdir(path.join(root, 'agent'), { recursive: true });
-    const { version } = JSON.parse(await readFile(path.join(process.env.OMP_SDK_DIR, 'package.json'), 'utf8'));
-    const nativeRoot = path.join(root, 'natives');
-    await cp(path.join(process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'), version), path.join(nativeRoot, version), { recursive: true });
+    const nativeRoot = await prepareSdkNatives(process.env.OMP_SDK_DIR, root);
     // PI_CONFIG_DIR is relative to the real home. Never override USERPROFILE: native addon lookup depends on it.
     const config = path.relative(os.homedir(), path.join(root, 'config'));
     assert.equal(config.split(path.sep).includes('..'), false, 'scratch config must remain under the real home');

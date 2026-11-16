@@ -1,4 +1,9 @@
-"""Deterministic gateway tests; no mount, root privileges, or Nix installation."""
+"""Deterministic FUSE-adapter tests; no mount, root privileges, or Nix installation.
+
+Host-folder semantics are specified once in test_host_files.py (Linux and Darwin
+primitives) and test_file_broker.py (real framed socket); these tests cover the
+Linux FUSE view built on them.
+"""
 
 import copy
 import errno
@@ -6,15 +11,21 @@ import os
 from pathlib import Path
 import socket
 import stat
+import sys
 import tempfile
-import threading
-from contextlib import contextmanager
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+if not sys.platform.startswith("linux"):
+    raise unittest.SkipTest("The FUSE adapter uses Linux O_PATH, /proc and libfuse; "
+                            "the host contract runs in test_host_files.py")
 
-import access_fs
+from fuse import FuseOSError  # noqa: E402
+
+import access_fs  # noqa: E402
+import host_files  # noqa: E402
+from host_files import HostFiles  # noqa: E402
 
 
 class Policy:
@@ -29,24 +40,6 @@ class Policy:
 
     def deny(self, kind, target, reason):
         self.denied.append((kind, target, reason))
-
-
-class ObservedRLock:
-    """Announce contenders without replacing the lock or filesystem operations."""
-
-    def __init__(self, contender, attempted):
-        self.lock = threading.RLock()
-        self.contender = contender
-        self.attempted = attempted
-
-    def __enter__(self):
-        if threading.current_thread().name == self.contender:
-            self.attempted.set()
-        self.lock.acquire()
-        return self
-
-    def __exit__(self, *exc):
-        self.lock.release()
 
 
 class AccessFSTests(unittest.TestCase):
@@ -86,8 +79,11 @@ class AccessFSTests(unittest.TestCase):
         self.store_patch = patch.object(access_fs, "STORE", str(self.store))
         self.store_patch.start()
         self.addCleanup(self.store_patch.stop)
+        self.host_files = HostFiles(self.policy)
+        self.addCleanup(self.host_files.close_all)
         self.fs = access_fs.AccessFS(self.policy, {"runtime": {
-            "roots": [str(self.base)], "primary_roots": [str(self.base)], "programs": []}}, closure)
+            "roots": [str(self.base)], "primary_roots": [str(self.base)], "programs": []},
+        }, closure, self.host_files)
         self.addCleanup(self.fs.destroy, "/")
 
     @staticmethod
@@ -201,196 +197,6 @@ class AccessFSTests(unittest.TestCase):
                 self.assertDenied(self.fs.readdir, self.host(directory), None)
                 directory.chmod(0o700)
 
-    def test_handle_validation_serializes_concurrent_file_and_directory_rename(self):
-        for directory, write in ((False, False), (False, True),
-                                 (True, False), (True, True)):
-            with self.subTest(directory=directory, write=write):
-                parent = self.allowed / f"parent-{directory}-{write}"
-                parent.mkdir()
-                file = parent / "data"
-                file.write_bytes(b"original")
-                path = self.host(file)
-                source = self.host(parent if directory else file)
-                target = source + "-moved"
-                entered, resume, attempted = (threading.Event() for _ in range(3))
-
-                class PausedValidationFS(access_fs.AccessFS):
-                    def _entry(fs, candidate, *args, **kwargs):
-                        if (threading.current_thread().name == "held-io"
-                                and candidate == path):
-                            entered.set()
-                            if not resume.wait(5):
-                                raise TimeoutError("Validation was not resumed")
-                        return super()._entry(candidate, *args, **kwargs)
-
-                fs = PausedValidationFS(self.policy, {}, lambda _: [])
-                fs._lock = ObservedRLock("rename", attempted)
-                self.addCleanup(fs.destroy, "/")
-                handle = fs.open(path, os.O_RDWR)
-                results, failures = [], []
-
-                def io():
-                    try:
-                        results.append(fs.write(path, b"X", 0, handle) if write
-                                       else fs.read(path, 20, 0, handle))
-                    except BaseException as error:
-                        failures.append(error)
-
-                def rename():
-                    try:
-                        fs.rename(source, target)
-                    except BaseException as error:
-                        failures.append(error)
-
-                reader = threading.Thread(target=io, name="held-io")
-                renamer = threading.Thread(target=rename, name="rename")
-                reader.start()
-                try:
-                    self.assertTrue(entered.wait(5), "IO did not reach validation")
-                    renamer.start()
-                    self.assertTrue(attempted.wait(5), "Rename did not contend")
-                finally:
-                    resume.set()
-                    reader.join(5)
-                    if renamer.ident is not None:
-                        renamer.join(5)
-                self.assertFalse(reader.is_alive())
-                self.assertFalse(renamer.is_alive())
-                self.assertEqual(failures, [])
-                self.assertEqual(results, [1 if write else b"original"])
-                self.assertEqual(fs.read(target, 20, 0, handle),
-                                 b"Xriginal" if write else b"original")
-                fs.release(target, handle)
-
-    def test_open_and_create_register_before_concurrent_file_and_parent_rename(self):
-        for create in (False, True):
-            for directory in (False, True):
-                with self.subTest(create=create, directory=directory):
-                    parent = self.allowed / f"opening-{create}-{directory}"
-                    parent.mkdir()
-                    file = parent / "data"
-                    if not create:
-                        file.write_bytes(b"original")
-                    path = self.host(file)
-                    source = self.host(parent if directory else file)
-                    target = source + "-moved"
-                    opened, resume, attempted, renamed = (
-                        threading.Event() for _ in range(4))
-
-                    class PausedRegistrationFS(access_fs.AccessFS):
-                        def _register(fs, candidate, fd, fi):
-                            os.fstat(fd)
-                            opened.set()
-                            if not resume.wait(5):
-                                raise TimeoutError("Registration was not resumed")
-                            return super()._register(candidate, fd, fi)
-
-                    fs = PausedRegistrationFS(self.policy, {}, lambda _: [])
-                    fs._lock = ObservedRLock("opening-rename", attempted)
-                    self.addCleanup(fs.destroy, "/")
-                    handles, failures = [], []
-
-                    def opening():
-                        try:
-                            handles.append(fs.create(path, 0o600) if create
-                                           else fs.open(path, os.O_RDWR))
-                        except BaseException as error:
-                            failures.append(error)
-
-                    def rename():
-                        try:
-                            fs.rename(source, target)
-                        except BaseException as error:
-                            failures.append(error)
-                        finally:
-                            renamed.set()
-
-                    opener = threading.Thread(target=opening, name="opening")
-                    renamer = threading.Thread(target=rename, name="opening-rename")
-                    opener.start()
-                    try:
-                        self.assertTrue(opened.wait(5), "Descriptor was not opened")
-                        unlocked = fs._lock.lock.acquire(blocking=False)
-                        if unlocked:
-                            fs._lock.lock.release()
-                        renamer.start()
-                        self.assertTrue(attempted.wait(5), "Rename did not contend")
-                        if unlocked:
-                            self.assertTrue(renamed.wait(5), "Rename did not finish")
-                    finally:
-                        resume.set()
-                        opener.join(5)
-                        if renamer.ident is not None:
-                            renamer.join(5)
-                    self.assertFalse(opener.is_alive())
-                    self.assertFalse(renamer.is_alive())
-                    self.assertEqual(failures, [])
-                    self.assertEqual(len(handles), 1)
-                    moved = target + ("/data" if directory else "")
-                    handle = handles[0]
-                    self.assertEqual(fs.read(moved, 20, 0, handle),
-                                     b"" if create else b"original")
-                    self.assertEqual(fs.write(moved, b"X", 0, handle), 1)
-                    self.assertEqual(fs.read(moved, 20, 0, handle),
-                                     b"X" if create else b"Xriginal")
-                    fs.release(moved, handle)
-
-    def test_concurrent_parent_rename_cannot_invalidate_pinned_logical_parent(self):
-        parent = self.allowed / "parent"
-        parent.mkdir()
-        file = parent / "data"
-        file.write_bytes(b"original")
-        path = self.host(file)
-        destination = self.host(self.allowed / "result")
-        moved = self.host(self.allowed / "moved")
-        pinned, resume, attempted = (threading.Event() for _ in range(3))
-
-        class PausedParentFS(access_fs.AccessFS):
-            @contextmanager
-            def _parent(fs, entry):
-                with super()._parent(entry) as value:
-                    if (threading.current_thread().name == "child-rename"
-                            and entry.target == str(file) and not pinned.is_set()):
-                        pinned.set()
-                        if not resume.wait(5):
-                            raise TimeoutError("Pinned parent was not resumed")
-                    yield value
-
-        fs = PausedParentFS(self.policy, {}, lambda _: [])
-        fs._lock = ObservedRLock("parent-rename", attempted)
-        self.addCleanup(fs.destroy, "/")
-        handle = fs.open(path, os.O_RDWR)
-        failures = []
-
-        def rename(old, new):
-            try:
-                fs.rename(old, new)
-            except BaseException as error:
-                failures.append(error)
-
-        child = threading.Thread(target=rename, args=(path, destination),
-                                 name="child-rename")
-        ancestor = threading.Thread(target=rename, args=(self.host(parent), moved),
-                                    name="parent-rename")
-        child.start()
-        try:
-            self.assertTrue(pinned.wait(5), "Child rename did not pin its parent")
-            ancestor.start()
-            self.assertTrue(attempted.wait(5), "Parent rename did not contend")
-        finally:
-            resume.set()
-            child.join(5)
-            if ancestor.ident is not None:
-                ancestor.join(5)
-        self.assertFalse(child.is_alive())
-        self.assertFalse(ancestor.is_alive())
-        self.assertEqual(failures, [])
-        self.assertEqual(fs.read(destination, 20, 0, handle), b"original")
-        self.assertEqual(fs.write(destination, b"X", 0, handle), 1)
-        self.assertEqual((self.allowed / "result").read_bytes(), b"Xriginal")
-        self.assertTrue((self.allowed / "moved").is_dir())
-        fs.release(destination, handle)
-
     def test_readonly_blocks_every_mutation(self):
         file = self.allowed / "file"
         file.write_bytes(b"unchanged")
@@ -440,18 +246,18 @@ class AccessFSTests(unittest.TestCase):
     def test_checked_inode_cannot_be_swapped_for_symlink_before_open(self):
         file = self.allowed / "data"
         file.write_bytes(b"original")
-        real_open = os.open
+        reopen = self.host_files.primitives.reopen
         swapped = False
 
-        def swapping_open(path, flags, *args, **kwargs):
+        def swapping_reopen(pin, flags):
             nonlocal swapped
-            if isinstance(path, str) and path.startswith("/proc/self/fd/") and not swapped:
+            if not swapped:
                 swapped = True
                 file.rename(self.allowed / "old")
                 file.symlink_to(self.secret / "credential")
-            return real_open(path, flags, *args, **kwargs)
+            return reopen(pin, flags)
 
-        with patch.object(access_fs.os, "open", side_effect=swapping_open):
+        with patch.object(self.host_files.primitives, "reopen", side_effect=swapping_reopen):
             handle = self.fs.open(self.host(file), os.O_WRONLY | os.O_TRUNC)
         self.fs.release(self.host(file), handle)
         self.assertTrue(swapped)
@@ -498,7 +304,7 @@ class AccessFSTests(unittest.TestCase):
                 return os.stat_result(fields)
             return value
 
-        with patch.object(access_fs.os, "fstat", side_effect=foreign_device):
+        with patch.object(host_files.os, "fstat", side_effect=foreign_device):
             self.assertDenied(self.read, self.host(file))
 
     def test_store_only_lists_approved_closures_and_revokes_programs(self):
@@ -614,6 +420,18 @@ class AccessFSTests(unittest.TestCase):
         self.fs._resolve_closure = resolver
         self.assertTrue(self.read(path).startswith(b"#!/bin/sh"))
 
+    def test_missing_store_metadata_is_not_found_but_existing_unapproved_files_stay_denied(self):
+        path = "/store/package.json"
+        for operation in (self.fs.getattr, self.read):
+            with self.assertRaises(OSError) as error:
+                operation(path)
+            self.assertEqual(error.exception.errno, errno.ENOENT)
+        (self.store / "package.json").write_text('{"type":"module"}')
+        for operation in (self.fs.getattr, self.read):
+            with self.assertRaises(OSError) as error:
+                operation(path)
+            self.assertEqual(error.exception.errno, errno.EACCES)
+
     def test_store_root_membership_does_not_match_a_prefix(self):
         other = self.store / (self.base.name + "-other")
         other.mkdir()
@@ -666,7 +484,7 @@ class AccessFSTests(unittest.TestCase):
         self.assertEqual(self.policy.denied[0][:2], ("folder", str(self.secret)))
         for index in range(300):
             self.assertDenied(self.fs.getattr, path + str(index))
-        self.assertLessEqual(len(self.fs._denials), 256)
+        self.assertLessEqual(len(self.host_files._denials), 256)
 
     def test_no_link_device_or_host_ownership_creation(self):
         for callback, args in (
@@ -679,6 +497,50 @@ class AccessFSTests(unittest.TestCase):
                 with self.assertRaises(OSError) as failure:
                     callback(*args)
                 self.assertEqual(failure.exception.errno, errno.EPERM)
+
+    def test_append_and_synchronous_open_flags_reach_host_files(self):
+        file = self.allowed / "log"
+        file.write_bytes(b"start")
+        path = self.host(file)
+        with patch.object(self.host_files, "fsync", wraps=self.host_files.fsync) as fsync:
+            handle = self.fs.open(path, os.O_WRONLY | os.O_APPEND | os.O_SYNC)
+            self.assertEqual(self.fs.write(path, b"-one", 0, handle), 4)
+            self.fs.release(path, handle)
+            handle = self.fs.open(path, os.O_WRONLY | os.O_APPEND | os.O_DSYNC)
+            self.assertEqual(self.fs.write(path, b"-two", 0, handle), 4)
+            self.fs.release(path, handle)
+        self.assertEqual(file.read_bytes(), b"start-one-two")
+        self.assertEqual([call.args[1] for call in fsync.call_args_list], [False, True])
+
+    def test_host_errors_are_fuse_errors_and_handles_release_on_destroy(self):
+        with self.assertRaises(FuseOSError) as failure:
+            self.fs.getattr(self.host(self.secret))
+        self.assertEqual(failure.exception.errno, errno.EACCES)
+        file = self.allowed / "data"
+        file.write_bytes(b"data")
+        self.fs.open(self.host(file), os.O_RDONLY)
+        self.fs.open(self.host(file), os.O_RDONLY)
+        self.assertEqual(len(self.host_files._handles), 2)
+        self.fs.destroy("/")
+        self.assertEqual(self.host_files._handles, {})
+
+    def test_store_handles_stay_read_only(self):
+        path = "/store/" + self.base.name + "/runtime"
+        handle = self.fs.open(path, os.O_RDONLY)
+        try:
+            for callback, args in ((self.fs.write, (path, b"X", 0, handle)),
+                                   (self.fs.truncate, (path, 0, handle)),
+                                   (self.fs.truncate, (path, 0)),
+                                   (self.fs.chmod, (path, 0o777)),
+                                   (self.fs.unlink, (path,)),
+                                   (self.fs.rename, (path, self.host(self.allowed / "x")))):
+                with self.subTest(operation=callback.__name__, args=args):
+                    with self.assertRaises(OSError) as failure:
+                        callback(*args)
+                    self.assertEqual(failure.exception.errno, errno.EROFS)
+        finally:
+            self.fs.release(path, handle)
+        self.assertEqual((self.base / "runtime").read_bytes(), b"base")
 
 
 if __name__ == "__main__":

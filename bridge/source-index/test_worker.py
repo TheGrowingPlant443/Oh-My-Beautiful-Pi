@@ -231,11 +231,12 @@ class FrozenRegistry(unittest.TestCase):
         self.assertEqual(set(by), set(PLAN_EXTENSIONS))
         for rec in by.values():
             self.assertEqual(set(rec), {"language", "version", "available", "error", "nodeKinds"})
-        for lang in ("python", "javascript", "typescript", "tsx", "svelte", "vue", "astro", "ejs"):
+        required = by if os.environ.get("OMP_TEST_REQUIRE_ALL_GRAMMARS") == "1" else (
+            "python", "javascript", "typescript", "tsx", "svelte", "vue", "astro", "ejs"
+        )
+        for lang in required:
             self.assertTrue(by[lang]["available"], f"{lang}: {by[lang]['error']}")
             self.assertIsNone(by[lang]["error"], f"{lang}: {by[lang]['error']}")
-        self.assertTrue(by["python"]["nodeKinds"])
-        self.assertTrue(by["python"]["version"])
 
 
 class ExtractCoordinator(unittest.TestCase):

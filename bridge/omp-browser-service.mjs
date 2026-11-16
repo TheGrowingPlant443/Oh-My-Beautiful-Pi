@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, stat } from 'node:fs/promises';
+import { access, mkdir, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 // OMBP_AGENT=omsp drives the omsp fork, whose packages use their own npm scope.
@@ -54,15 +55,24 @@ export function unixChromiumCandidates(env = process.env, platform = process.pla
     ...(platform === 'darwin' ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
       '/Applications/Chromium.app/Contents/MacOS/Chromium', '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
       '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'] : []),
+    ...(platform === 'darwin' && home ? [
+      'Google Chrome.app/Contents/MacOS/Google Chrome',
+      'Chromium.app/Contents/MacOS/Chromium',
+      'Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+      'Brave Browser.app/Contents/MacOS/Brave Browser',
+    ].map(bundle => path.join(home, 'Applications', bundle)) : []),
   ];
 }
-const isFile = async file => (await stat(file).catch(() => null))?.isFile() === true;
+const isExecutable = async (file, platform) => {
+  if (!(await stat(file).catch(() => null))?.isFile()) return false;
+  return platform === 'win32' || await access(file, constants.X_OK).then(() => true, () => false);
+};
 
 /**
  * Passive installed-only resolution: an explicit absolute PUPPETEER_EXECUTABLE_PATH, then the SDK's installed Windows
  * candidates, then an already existing Puppeteer cache executable. It never installs, downloads or runs a browser.
  */
-export async function resolveInstalledChromium({ env = process.env, platform = process.platform, exists = isFile, cached = async () => null } = {}) {
+export async function resolveInstalledChromium({ env = process.env, platform = process.platform, exists = file => isExecutable(file, platform), cached = async () => null } = {}) {
   if (!['win32', 'linux', 'darwin'].includes(platform)) throw new BrowserError('unsupported_platform', 'Owned terminal browsers require Windows, Linux or macOS');
   const explicit = env.PUPPETEER_EXECUTABLE_PATH;
   if (explicit) {
@@ -138,7 +148,8 @@ export class BrowserService {
     this.native = options.native ?? null;
     this.log = options.log ?? (() => {});
     this.helperSession = options.helperSession ?? randomBytes(16).toString('hex');
-    this.resolveExecutable = options.resolveExecutable ?? (() => resolveInstalledChromium({ cached: () => this.cachedChromium() }));
+    const discoveryEnv = options.discoveryEnv ?? { ...process.env };
+    this.resolveExecutable = options.resolveExecutable ?? (() => resolveInstalledChromium({ env: discoveryEnv, cached: () => this.cachedChromium() }));
     this.settings = { headless: false, embedded: true };
     this.owners = new Map(); this.capabilities = new Map(); this.epoch = Date.now();
     this.server = null; this.stopping = false;
@@ -762,6 +773,7 @@ class ScopedCdpProxy {
 if (import.meta.main) {
   const [root,sdkDir,session]=process.argv.slice(2);
   if(!root||!sdkDir)throw new Error('browser service requires app root and SDK directory');
+  const discoveryEnv = { ...process.env };
   // SDK cache initialization is private to this helper, not the real ~/.omp.
   const runtime=path.join(root,'terminal-browsers','runtime');await mkdir(runtime,{recursive:true});
   process.env.USERPROFILE=runtime;process.env.HOME=runtime;process.env.PI_CODING_AGENT_DIR=path.join(runtime,'agent');process.env.OMSP_CODING_AGENT_DIR=process.env.PI_CODING_AGENT_DIR;
@@ -772,7 +784,7 @@ if (import.meta.main) {
   // Each helper run has its own session; every native request carries it and old runs' frames are ignored natively.
   const helperSession=session||randomBytes(16).toString('hex');
   const native=new NativeChannel(output);
-  const service=new BrowserService(root,sdkDir,state=>{log('state',state.instanceId,state.state,`pid=${state.pid}`,state.error??'');output({type:'state',data:state});},{native,log,helperSession});
+  const service=new BrowserService(root,sdkDir,state=>{log('state',state.instanceId,state.state,`pid=${state.pid}`,state.error??'');output({type:'state',data:state});},{native,log,helperSession,discoveryEnv});
   await service.start(); output({type:'ready',helperSession});
   let chunks=[];let bytes=0;
   const respond=frame=>{

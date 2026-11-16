@@ -14,7 +14,7 @@ use super::types::SetupStepState;
 use super::types::{
     AgentReportRequest, CredentialAction, CredentialTarget, OwnershipStatus, Prerequisite,
     QualityConfig, QualityCredentialUpdate, QualityFinding, QualityMode, QualityOptions,
-    QualityPhase, QualityProject, QualityRuntime, QualityScan, QualityScanStatus,
+    QualityPhase, QualityProject, QualityRuntime, QualityScan, QualityScanStatus, QualityState,
     QualityToolOutcome, Result, Scanner, Severity, ToolStatus, BUSY_MESSAGE, RULES_MESSAGE,
     STALE_MESSAGE,
 };
@@ -104,11 +104,11 @@ impl Engine for FakeEngine {
     fn image_exists(&self, _: &str, _: &RunControl) -> Result<bool> {
         Ok(true)
     }
-    fn pull(&self, image: &str, _: &RunControl) -> Result<()> {
+    fn pull(&self, image: &str, _: Option<&str>, _: &RunControl) -> Result<()> {
         self.state.lock().ops.push(format!("pull {image}"));
         Ok(())
     }
-    fn build_image(&self, tag: &str, _: &Path, _: &RunControl) -> Result<()> {
+    fn build_image(&self, tag: &str, _: &Path, _: Option<&str>, _: &RunControl) -> Result<()> {
         self.state.lock().ops.push(format!("build {tag}"));
         Ok(())
     }
@@ -416,6 +416,8 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
+        self.svc.request_cancel_all();
+        join_workers(&self.svc);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -449,6 +451,450 @@ fn harness() -> Harness {
         installed,
         dir,
         port,
+    }
+}
+
+fn join_workers(svc: &CodeQualityService) {
+    loop {
+        let workers = std::mem::take(&mut *svc.workers.lock());
+        if workers.is_empty() {
+            break;
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+}
+
+fn refreshed_state(svc: &Arc<CodeQualityService>) -> QualityState {
+    svc.schedule_credential_refresh().unwrap();
+    join_workers(svc);
+    let state = svc.state();
+    assert!(state.credentials.checked);
+    state
+}
+
+struct CredentialRead {
+    target: String,
+    reply: std::sync::mpsc::Sender<Result<Option<String>>>,
+}
+
+struct ControlledSecrets {
+    reads: std::sync::mpsc::Sender<CredentialRead>,
+    verifications: AtomicU64,
+    verification_error: Mutex<Option<String>>,
+}
+
+impl SecretStore for ControlledSecrets {
+    fn read(&self, target: &str) -> Result<Option<String>> {
+        let (reply, result) = std::sync::mpsc::channel();
+        self.reads.send(CredentialRead { target: target.into(), reply }).map_err(|e| e.to_string())?;
+        result.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?
+    }
+
+    fn verify(&self) -> Result<()> {
+        self.verifications.fetch_add(1, Ordering::Relaxed);
+        match self.verification_error.lock().clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn write(&self, _: &str, _: &str) -> Result<()> {
+        panic!("a presence check never writes a secret")
+    }
+
+    fn delete(&self, _: &str) -> Result<()> {
+        panic!("a presence check never deletes a secret")
+    }
+}
+
+struct NoCredentialEngine;
+
+impl EngineFactory for NoCredentialEngine {
+    fn engine(&self, _: &QualityRuntime) -> Result<Arc<dyn Engine>> {
+        panic!("credential initialization and ownership do not start an engine")
+    }
+}
+
+struct CredentialHarness {
+    svc: Arc<CodeQualityService>,
+    secrets: Arc<ControlledSecrets>,
+    reads: std::sync::mpsc::Receiver<CredentialRead>,
+    dir: PathBuf,
+}
+
+impl CredentialHarness {
+    fn new(config: QualityConfig) -> Self {
+        let dir = std::env::temp_dir().join(format!("omp-cq-presence-{}", uuid::Uuid::new_v4()));
+        let paths = store::Paths::new(dir.join("code-quality"));
+        let mut file = store::ConfigFile::default();
+        file.config = config;
+        store::save_config(&paths, &file).unwrap();
+        let (sender, reads) = std::sync::mpsc::channel();
+        let secrets = Arc::new(ControlledSecrets {
+            reads: sender,
+            verifications: AtomicU64::new(0),
+            verification_error: Mutex::new(None),
+        });
+        let svc = Self::service(&dir, secrets.clone());
+        Self { svc, secrets, reads, dir }
+    }
+
+    fn service(dir: &Path, secrets: Arc<ControlledSecrets>) -> Arc<CodeQualityService> {
+        CodeQualityService::with_parts(
+            dir.to_path_buf(),
+            Arc::new(NoCredentialEngine),
+            secrets,
+            ProcessLock::acquire(&super::process_lock::name_for(&dir.join("code-quality"))),
+            ready_probe(Arc::new(AtomicBool::new(true))),
+        )
+    }
+
+    fn enterprise() -> Self {
+        Self::new(QualityConfig {
+            mode: QualityMode::SonarqubeEnterprise,
+            enterprise_url: "https://sonar.example.test/one".into(),
+            ..Default::default()
+        })
+    }
+
+    fn read(&self) -> CredentialRead {
+        self.reads.recv_timeout(Duration::from_secs(5)).expect("tracked credential read")
+    }
+}
+
+impl Drop for CredentialHarness {
+    fn drop(&mut self) {
+        self.svc.shutdown();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn credential_construction_and_startup_never_wait_for_the_keychain() {
+    for activated in [false, true] {
+        let h = CredentialHarness::enterprise();
+        assert!(h.reads.try_recv().is_err(), "construction must not read the store");
+        assert_eq!(h.secrets.verifications.load(Ordering::Relaxed), 0);
+        assert!(!h.svc.state().credentials.checked);
+        h.svc.inner.lock().file.activated = activated;
+        h.svc.reconcile_on_start();
+        let pending = h.read();
+        assert!(h.svc.ownership.try_lock().is_some(), "Keychain wait must not hold ownership");
+        assert!(h.svc.inner.try_lock().is_some(), "Keychain wait must not hold state");
+        let state = h.svc.set_start_at_launch(false).unwrap();
+        assert!(!state.busy && !state.credentials.checked);
+        assert_eq!(state.effective_mode, None);
+        h.svc.inner.lock().error = Some("A newer scan failure".into());
+        pending.reply.send(Err("private provider detail must not escape".into())).unwrap();
+        join_workers(&h.svc);
+        let failed = h.svc.state();
+        assert!(failed.credentials.checked);
+        assert_eq!(failed.credentials.error.as_deref(), Some("Credential store unavailable"));
+        assert_eq!(failed.error.as_deref(), Some("A newer scan failure"));
+        assert!(!serde_json::to_string(&failed).unwrap().contains("private provider detail"));
+        h.svc.schedule_credential_refresh().unwrap();
+        assert!(!h.svc.state().credentials.checked);
+        h.read().reply.send(Ok(Some("test-only-token".into()))).unwrap();
+        join_workers(&h.svc);
+        let recovered = h.svc.state();
+        assert!(recovered.credentials.checked && recovered.credentials.enterprise);
+        assert!(recovered.credentials.error.is_none());
+        assert_eq!(recovered.error, failed.error);
+    }
+}
+
+#[test]
+fn credential_refresh_publishes_only_the_newest_generation() {
+    let h = CredentialHarness::enterprise();
+    h.svc.schedule_credential_refresh().unwrap();
+    let first = h.read();
+    h.svc.schedule_credential_refresh().unwrap();
+    let latest = h.read();
+    assert_eq!(first.target, latest.target);
+    latest.reply.send(Ok(Some("test-only-token".into()))).unwrap();
+    // The older worker is intentionally blocked; join only the newer handle.
+    let worker = h.svc.workers.lock().pop().unwrap();
+    worker.join().unwrap();
+    let newest = h.svc.state().credentials;
+    assert!(newest.checked && newest.enterprise && newest.error.is_none());
+    first.reply.send(Err("obsolete provider failure".into())).unwrap();
+    join_workers(&h.svc);
+    assert_eq!(h.svc.state().credentials, newest);
+}
+
+#[test]
+fn credential_refresh_rechecks_the_entire_configuration_identity() {
+    for field in ["enterprise", "runtime", "mode", "port"] {
+        let h = CredentialHarness::enterprise();
+        h.svc.schedule_credential_refresh().unwrap();
+        let stale = h.read();
+        {
+            // Even an already captured target cannot publish into a different configuration.
+            let mut inner = h.svc.inner.lock();
+            match field {
+                "enterprise" => inner.file.config.enterprise_url = "https://sonar.example.test/two".into(),
+                "runtime" => inner.file.config.runtime = QualityRuntime::DockerDesktop,
+                "mode" => inner.file.config.mode = QualityMode::SonarqubeCommunity,
+                _ => inner.file.config.community_port += 1,
+            }
+        }
+        stale.reply.send(Ok(Some("stale-token".into()))).unwrap();
+        join_workers(&h.svc);
+        assert!(!h.svc.state().credentials.checked, "{field}");
+        h.svc.schedule_credential_refresh().unwrap();
+        let current = h.read();
+        if field == "enterprise" {
+            assert_ne!(stale.target, current.target);
+        }
+        current.reply.send(Ok(None)).unwrap();
+        join_workers(&h.svc);
+        let current = h.svc.state().credentials;
+        assert!(current.checked && !current.enterprise && current.error.is_none());
+    }
+}
+
+#[test]
+fn credential_refresh_invalidates_replaced_community_resource_sets() {
+    let h = CredentialHarness::new(QualityConfig::default());
+    let config = h.svc.state().config;
+    h.svc.set_possibly_running(&config.runtime, Some("first-engine"), config.community_port, false).unwrap();
+    h.svc.schedule_credential_refresh().unwrap();
+    let first = h.read();
+    first.reply.send(Ok(Some("first-token".into()))).unwrap();
+    join_workers(&h.svc);
+    assert!(h.svc.state().credentials.community);
+    h.svc.schedule_credential_refresh().unwrap();
+    let stale = h.read();
+    h.svc.set_possibly_running(&config.runtime, Some("replacement-engine"), config.community_port, false).unwrap();
+    assert!(!h.svc.state().credentials.checked);
+    assert!(!h.svc.state().credentials.community);
+    stale.reply.send(Ok(Some("first-token".into()))).unwrap();
+    join_workers(&h.svc);
+    assert!(!h.svc.state().credentials.checked, "the old resource-set read is inapplicable");
+    h.svc.schedule_credential_refresh().unwrap();
+    let replacement = h.read();
+    assert_ne!(first.target, replacement.target);
+    replacement.reply.send(Ok(None)).unwrap();
+    join_workers(&h.svc);
+    let state = h.svc.state();
+    assert!(state.credentials.checked && !state.credentials.community && state.credentials.error.is_none());
+    // No engine operations are needed to retire this file-only fixture.
+    h.svc.release_owner(false);
+}
+
+#[test]
+fn credential_refresh_is_owner_only_and_acquisition_does_not_wait_for_it() {
+    let h = CredentialHarness::enterprise();
+    let waiting = CredentialHarness::service(&h.dir, h.secrets.clone());
+    waiting.reconcile_on_start();
+    join_workers(&waiting);
+    assert_eq!(waiting.state().ownership.status, OwnershipStatus::OtherProcess);
+    assert!(h.reads.try_recv().is_err());
+    assert_eq!(h.secrets.verifications.load(Ordering::Relaxed), 0);
+    h.svc.release_owner(false);
+    let acquiring = waiting.clone();
+    let (done, acquired) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || done.send(acquiring.refresh_ownership()).unwrap());
+    acquired.recv_timeout(Duration::from_secs(2)).expect("acquisition is not a Keychain wait").unwrap();
+    thread.join().unwrap();
+    let pending = h.read();
+    assert_eq!(waiting.state().ownership.status, OwnershipStatus::Owned);
+    assert!(!waiting.state().credentials.checked);
+    pending.reply.send(Ok(Some("owner-token".into()))).unwrap();
+    join_workers(&waiting);
+    assert!(waiting.state().credentials.enterprise);
+    waiting.schedule_credential_refresh().unwrap();
+    let retiring = h.read();
+    waiting.release_owner(true);
+    retiring.reply.send(Ok(Some("retired-token".into()))).unwrap();
+    join_workers(&waiting);
+    assert_eq!(waiting.state().ownership.status, OwnershipStatus::HandedOff);
+    assert!(!waiting.state().credentials.checked);
+    waiting.schedule_credential_refresh().unwrap();
+    assert!(h.reads.try_recv().is_err(), "handed-off owners never prompt");
+    waiting.shutdown();
+}
+
+#[test]
+fn credential_shutdown_joins_the_pending_read_and_rejects_late_workers() {
+    let h = CredentialHarness::enterprise();
+    h.svc.schedule_credential_refresh().unwrap();
+    let pending = h.read();
+    let closing = h.svc.clone();
+    let (done, closed) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        closing.shutdown();
+        done.send(()).unwrap();
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !h.svc.closing.load(Ordering::Acquire) {
+        assert!(std::time::Instant::now() < deadline, "shutdown did not close admission");
+        std::thread::yield_now();
+    }
+    assert!(closed.try_recv().is_err(), "shutdown must join the pending credential worker");
+    assert!(ProcessLock::acquire(&super::process_lock::name_for(&h.svc.paths.root)).unwrap().is_none());
+    pending.reply.send(Ok(Some("too-late-token".into()))).unwrap();
+    closed.recv_timeout(Duration::from_secs(5)).unwrap();
+    thread.join().unwrap();
+    assert!(!h.svc.state().credentials.checked, "closing rejects late publication");
+    assert!(h.svc.workers.lock().is_empty());
+    assert!(h.svc.spawn_worker("too-late", || panic!("closing must not admit work")).is_err());
+}
+
+#[test]
+fn credential_worker_registration_and_close_share_one_admission_lock() {
+    let h = CredentialHarness::enterprise();
+    let workers = h.svc.workers.lock();
+    let spawning = h.svc.clone();
+    let (attempt, attempted) = std::sync::mpsc::channel();
+    let (started, running) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        attempt.send(()).unwrap();
+        spawning.spawn_worker("registration-race", move || { let _ = started.send(()); })
+    });
+    attempted.recv().unwrap();
+    assert!(running.recv_timeout(Duration::from_millis(100)).is_err(), "a worker cannot start before it can be registered");
+    // Model shutdown closing admission while holding the very same worker-list lock.
+    h.svc.closing.store(true, Ordering::Release);
+    drop(workers);
+    let result = thread.join().unwrap();
+    h.svc.closing.store(false, Ordering::Release);
+    assert!(result.is_err());
+    assert!(running.try_recv().is_err());
+    assert!(h.svc.workers.lock().is_empty());
+}
+
+#[test]
+fn credential_refresh_checks_store_availability_even_without_token_targets() {
+    let h = CredentialHarness::new(QualityConfig::default());
+    *h.secrets.verification_error.lock() = Some("private verification detail".into());
+    h.svc.schedule_credential_refresh().unwrap();
+    join_workers(&h.svc);
+    let failed = h.svc.state();
+    assert!(failed.credentials.checked);
+    assert_eq!(failed.credentials.error.as_deref(), Some("Credential store unavailable"));
+    assert!(!failed.credentials.community && !failed.credentials.enterprise);
+    assert!(failed.error.is_none());
+    assert!(h.reads.try_recv().is_err());
+    *h.secrets.verification_error.lock() = None;
+    let checked = refreshed_state(&h.svc);
+    assert!(checked.credentials.error.is_none());
+    assert!(!checked.credentials.community && !checked.credentials.enterprise);
+    assert_eq!(h.secrets.verifications.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn credential_refresh_does_not_begin_a_second_lookup_after_handoff() {
+    let h = CredentialHarness::enterprise();
+    let config = h.svc.state().config;
+    h.svc.set_possibly_running(&config.runtime, Some("engine"), config.community_port, false).unwrap();
+    h.svc.schedule_credential_refresh().unwrap();
+    let community = h.read();
+    assert_eq!(Some(&community.target), h.svc.community_token_target(&config.runtime).as_ref());
+    h.svc.release_owner(true);
+    community.reply.send(Ok(Some("retired-token".into()))).unwrap();
+    join_workers(&h.svc);
+    assert!(h.reads.try_recv().is_err(), "the superseded refresh must not prompt for Enterprise");
+    assert!(!h.svc.state().credentials.checked);
+}
+
+#[test]
+fn credential_pending_setup_matches_the_running_analyzers_requirements() {
+    use super::types::{CredentialPresence, SetupStepState};
+
+    for mode in [
+        QualityMode::SonarqubeCommunity,
+        QualityMode::SonarqubeEnterprise,
+        QualityMode::Alternate,
+    ] {
+        let h = harness();
+        {
+            let mut inner = h.svc.inner.lock();
+            inner.file.config.mode = mode;
+            inner.file.config.runtime = QualityRuntime::DockerDesktop;
+            inner.file.activated = true;
+            inner.effective = Some(mode);
+            inner.prerequisites = vec![Prerequisite {
+                runtime: QualityRuntime::DockerDesktop,
+                installed: true,
+                ready: true,
+                needs_restart: false,
+                message: None,
+            }];
+            inner.error = Some("An ordinary scan failure".into());
+        }
+        let pending = h.svc.state();
+        assert!(!pending.fatal, "ordinary errors are not fatal-state evidence");
+        assert!(!pending.credentials.checked);
+        assert!(!pending.setup.needed, "{mode:?}: pending presence is not missing setup");
+        assert!(!pending.setup.install_required);
+        assert!(pending.setup.steps.iter().filter(|step| matches!(step.id.as_str(), "runtime" | "server")).all(|step| step.state == SetupStepState::Done));
+        if mode == QualityMode::SonarqubeCommunity {
+            let token = pending.setup.steps.iter().find(|step| step.id == "token").unwrap();
+            assert_eq!(token.state, SetupStepState::Pending);
+            assert_eq!(token.label, "Check the scan token");
+        }
+        if cfg!(unix) && mode != QualityMode::Alternate {
+            assert_eq!(pending.setup.steps.iter().find(|step| step.id == "credentials").unwrap().state, SetupStepState::Pending);
+        }
+        h.svc.inner.lock().credentials = CredentialPresence {
+            checked: true,
+            error: Some("Credential store unavailable".into()),
+            ..Default::default()
+        };
+        let unavailable = h.svc.state();
+        if mode == QualityMode::Alternate {
+            assert!(!unavailable.setup.needed, "Alternate does not use Sonar credentials");
+            assert!(unavailable.setup.steps.iter().all(|step| !matches!(step.id.as_str(), "credentials" | "token")));
+        } else if cfg!(unix) || mode == QualityMode::SonarqubeCommunity {
+            assert!(unavailable.setup.needed, "a completed failed prerequisite remains actionable");
+        }
+        h.svc.inner.lock().credentials = CredentialPresence {
+            checked: true,
+            ..Default::default()
+        };
+        assert_eq!(h.svc.state().setup.needed, mode == QualityMode::SonarqubeCommunity);
+        {
+            let mut inner = h.svc.inner.lock();
+            inner.credentials = CredentialPresence::default();
+            inner.effective = None;
+        }
+        assert!(h.svc.state().setup.needed, "a stopped analyzer still needs starting");
+        {
+            let mut inner = h.svc.inner.lock();
+            inner.effective = Some(mode);
+            inner.prerequisites[0].installed = false;
+            inner.prerequisites[0].ready = false;
+        }
+        assert!(h.svc.state().setup.needed, "missing runtime prerequisites still require setup");
+    }
+}
+
+#[test]
+fn credential_fatal_state_reports_why_no_check_can_be_admitted() {
+    for file in ["config.json", "installation.json", "resources.json"] {
+        let h = CredentialHarness::enterprise();
+        h.svc.shutdown();
+        std::fs::write(h.svc.paths.root.join(file), b"{invalid").unwrap();
+        let invalid = CredentialHarness::service(&h.dir, h.secrets.clone());
+        let before = invalid.state();
+        assert_eq!(before.ownership.status, OwnershipStatus::Owned);
+        assert!(before.fatal && before.error.is_some(), "{file}");
+        assert!(!before.credentials.checked, "a refused check must not fabricate presence");
+        invalid.reconcile_on_start();
+        join_workers(&invalid);
+        invalid.schedule_credential_refresh().unwrap();
+        let after = invalid.check_prerequisites().unwrap();
+        assert!(after.fatal);
+        assert_eq!(after.error, before.error);
+        assert_eq!(after.credentials, before.credentials);
+        assert_eq!(serde_json::to_value(&after).unwrap()["fatal"], true);
+        assert!(invalid.workers.lock().is_empty());
+        assert!(h.reads.try_recv().is_err());
+        assert_eq!(h.secrets.verifications.load(Ordering::Relaxed), 0);
+        invalid.shutdown();
     }
 }
 
@@ -715,10 +1161,10 @@ fn token_only_updates_do_not_restart_and_invalid_tokens_keep_the_old_one() {
         token: Some(token.into()),
     };
     let ops = h.desktop.ops().len();
-    let state = h
-        .svc
+    h.svc
         .configure(config.clone(), 1, Some(update("good-token")))
         .unwrap();
+    let state = refreshed_state(&h.svc);
     assert!(state.credentials.community);
     assert_eq!(
         h.desktop.ops().len(),
@@ -738,7 +1184,8 @@ fn token_only_updates_do_not_restart_and_invalid_tokens_keep_the_old_one() {
         action: CredentialAction::Clear,
         token: None,
     };
-    let state = h.svc.configure(config, 1, Some(cleared)).unwrap();
+    h.svc.configure(config, 1, Some(cleared)).unwrap();
+    let state = refreshed_state(&h.svc);
     assert!(!state.credentials.community);
     assert_eq!(h.desktop.ops().len(), ops);
 }
@@ -1005,6 +1452,13 @@ fn scans_need_a_ready_backend_and_a_saved_token() {
     h.svc
         .configure(h.config(QualityRuntime::DockerDesktop), 1, Some(cleared))
         .unwrap();
+    join_workers(&h.svc);
+    // Cached presence is presentation only, even if it claims a now-deleted token exists.
+    {
+        let mut inner = h.svc.inner.lock();
+        inner.credentials.checked = true;
+        inner.credentials.community = true;
+    }
     let preparation = h.svc.prepare_scan(&project("omp-a")).unwrap();
     assert!(!preparation.recipe.is_empty() && !preparation.requires_consent);
     assert!(
@@ -1037,10 +1491,10 @@ fn admin_password_target(h: &Harness, set: &str) -> String {
 #[test]
 fn a_fresh_server_gets_a_random_admin_password_and_a_scan_token() {
     let h = harness();
-    let state = h
-        .svc
+    h.svc
         .configure(h.config(QualityRuntime::DockerDesktop), 0, None)
         .unwrap();
+    let state = refreshed_state(&h.svc);
     assert!(state.credentials.community, "token created automatically");
     assert_eq!(h.sonar.count("/api/users/change_password"), 1);
     assert_eq!(h.sonar.count("/api/user_tokens/generate"), 1);
@@ -1097,10 +1551,10 @@ fn starting_again_does_not_touch_the_admin_account_or_create_another_token() {
 fn an_admin_password_changed_elsewhere_is_never_touched() {
     let h = harness();
     h.sonar.password_changed.store(true, Ordering::Relaxed);
-    let state = h
-        .svc
+    h.svc
         .configure(h.config(QualityRuntime::DockerDesktop), 0, None)
         .unwrap();
+    let state = refreshed_state(&h.svc);
     assert_eq!(
         state.effective_mode,
         Some(QualityMode::SonarqubeCommunity),
@@ -1128,10 +1582,10 @@ fn an_admin_password_changed_elsewhere_is_never_touched() {
 fn a_rejected_password_change_leaves_no_saved_admin_password() {
     let h = harness();
     h.sonar.fail_change.store(true, Ordering::Relaxed);
-    let state = h
-        .svc
+    h.svc
         .configure(h.config(QualityRuntime::DockerDesktop), 0, None)
         .unwrap();
+    let state = refreshed_state(&h.svc);
     assert!(!state.credentials.community);
     let set = state.community.runtime_id.unwrap();
     assert_eq!(
@@ -1190,6 +1644,7 @@ fn setup_steps_follow_what_is_installed_started_and_saved() {
         inner.options.wsl_features_missing = false;
         inner.options.podman_app_connection = Some("omp-manager-quality".into());
         inner.effective = Some(QualityMode::SonarqubeCommunity);
+        inner.credentials.checked = true;
         inner.credentials.community = true;
     }
     let setup = h.svc.state().setup;
@@ -1227,7 +1682,8 @@ fn nothing_starts_at_app_launch_but_opening_the_view_starts_the_analyzer() {
     h.svc.shutdown();
     let (svc, desktop, _podman) = h.restart();
     svc.reconcile_on_start();
-    std::thread::sleep(Duration::from_millis(300));
+    join_workers(&svc);
+    assert!(svc.state().credentials.checked);
     assert!(
         desktop.ops().is_empty(),
         "launch started nothing: {:?}",
@@ -1922,7 +2378,8 @@ fn start_on_installed_prerequisites_bootstraps_without_installation_consent() {
     }
     let setup = h.svc.check_prerequisites().unwrap().setup;
     assert!(setup.needed && !setup.install_required);
-    let state = h.svc.start_service(0).unwrap();
+    h.svc.start_service(0).unwrap();
+    let state = refreshed_state(&h.svc);
     assert!(state.activated && state.credentials.community);
     assert_eq!(state.effective_mode, Some(QualityMode::SonarqubeCommunity));
     assert!(!state.setup.needed && !state.setup.install_required);

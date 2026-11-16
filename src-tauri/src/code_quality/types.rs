@@ -138,9 +138,11 @@ pub struct CommunityState {
     pub runtime_id: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialPresence {
+    pub checked: bool,
+    pub error: Option<String>,
     pub community: bool,
     pub enterprise: bool,
 }
@@ -233,6 +235,8 @@ pub struct QualityState {
     pub operation_id: Option<String>,
     pub requested_config: Option<QualityConfig>,
     pub error: Option<String>,
+    /// Persisted state is invalid; no operation or credential check can be admitted.
+    pub fatal: bool,
     pub community: CommunityState,
     pub credentials: CredentialPresence,
     pub rules: RulesState,

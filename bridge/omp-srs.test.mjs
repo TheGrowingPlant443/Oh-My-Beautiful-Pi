@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { cp, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -11,6 +11,7 @@ import { createVisualizationGuard } from './omp-visualization-guard.mjs';
 import { installNativeDecisions } from './omp-native-ui.mjs';
 import { installWorkspaceChanges } from './omp-workspace.mjs';
 import { controlAllowed, nativeAnswer } from './omp-manager.mjs';
+import { prepareSdkNatives } from './fixtures/sdk-natives.mjs';
 
 const JOB = '11111111-1111-4111-8111-111111111111';
 const ATTEMPT = '22222222-2222-4222-8222-222222222222';
@@ -584,9 +585,7 @@ test('installed SDK compaction, willContinue and automatic continuation keep SRS
   const root = await mkdtemp(path.join(os.homedir(), '.omp-srs-compaction-'));
   try {
     await mkdir(path.join(root, 'agent'), { recursive: true });
-    const { version } = JSON.parse(await readFile(path.join(sdk, 'package.json'), 'utf8'));
-    const nativeRoot = path.join(root, 'natives');
-    await cp(path.join(process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'), version), path.join(nativeRoot, version), { recursive: true });
+    const nativeRoot = await prepareSdkNatives(sdk, root);
     // PI_CONFIG_DIR is relative to the real home; never override USERPROFILE.
     const config = path.relative(os.homedir(), path.join(root, 'config'));
     assert.equal(config.split(path.sep).includes('..'), false);
@@ -757,10 +756,7 @@ test('real CLI admits System/SRS prompts once and runs a constrained native work
 }, async () => {
   const root = await mkdtemp(path.join(os.homedir(), '.omp-architect-delivery-'));
   try {
-    const nativeRoot = path.join(root, 'natives');
-    const { version } = JSON.parse(await readFile(path.join(sdk, 'package.json'), 'utf8'));
-    await mkdir(nativeRoot, { recursive: true });
-    await cp(path.join(process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'), version), path.join(nativeRoot, version), { recursive: true });
+    const nativeRoot = await prepareSdkNatives(sdk, root);
     const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [fileURLToPath(new URL('./fixtures/architect-delivery-scenario.mjs', import.meta.url))], {
       env: { ...process.env, ARCHITECT_DELIVERY_ROOT: root, HOME: root, USERPROFILE: root,
         PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: '.omp', PI_CONFIG_FILES: '', PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default',

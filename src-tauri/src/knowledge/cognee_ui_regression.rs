@@ -888,65 +888,71 @@ fn table_rows_use_network_byte_order_and_inconsistent_counts_are_rejected() {
 #[test]
 fn only_the_installed_uvicorn_app_with_an_unchanged_process_owning_a_loopback_listener_is_a_backend(
 ) {
-    let python = Path::new("C:/Cognee/venv/Scripts/python.exe");
-    let command =
-        |python: &str, tail: &str| format!("\"{python}\" -m uvicorn cognee.api.client:app {tail}");
-    let row = |pid: u32, created: u64, exe: &str, cmd: String| Row {
+    let python = Path::new("C:/Cognee café/venv/Scripts/python.exe");
+    let command = |python: &str, tail: &[&str]| {
+        [python, "-m", "uvicorn", "cognee.api.client:app"]
+            .into_iter()
+            .chain(tail.iter().copied())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let row = |pid: u32, created: u64, exe: &str, argv: Vec<String>| Row {
         pid,
         created,
         exe: exe.into(),
-        cmd,
+        argv,
     };
-    let installed = "C:\\Cognee\\venv\\Scripts\\python.exe";
+    let installed = "C:\\Cognee café\\venv\\Scripts\\python.exe";
     let rows = vec![
         // The venv launcher and the base interpreter it starts: the listener belongs to the child.
         row(
             10,
             1_000_000,
             installed,
-            command(installed, "--host localhost --port 8000"),
+            command(installed, &["--host", "localhost", "--port", "8000"]),
         ),
         row(
             11,
             1_000_500,
             "C:\\Python\\python.exe",
-            command(installed, "--host localhost --port 8000"),
+            command(installed, &["--host", "localhost", "--port", "8000"]),
         ),
         row(
             12,
             2_000_000,
             "C:\\Python\\python.exe",
-            command(installed, "--host 0.0.0.0 --port 8001"),
+            command(installed, &["--host", "0.0.0.0", "--port", "8001"]),
         ),
         row(
             13,
             3_000_000,
             "C:\\Other\\python.exe",
-            command("C:\\Other\\python.exe", "--port 8002"),
+            command("C:\\Other\\python.exe", &["--port", "8002"]),
         ),
         row(
             14,
             4_000_000,
             "C:\\Python\\python.exe",
-            command(installed, "--port 8003"),
+            command(installed, &["--port", "8003"]),
         ),
         row(
             15,
             5_000_000,
             "C:\\Python\\python.exe",
-            command(installed, "--port 8004"),
+            command(installed, &["--port", "8004"]),
         ),
         row(
             16,
             6_000_000,
             "C:\\Python\\python.exe",
-            "\"C:\\Cognee\\venv\\Scripts\\python.exe\" -m uvicorn other.app:app --port 8005".into(),
+            [installed, "-m", "uvicorn", "other.app:app", "--port", "8005"]
+                .into_iter().map(str::to_owned).collect(),
         ),
         row(
             17,
             7_000_000,
             "C:\\Python\\python.exe",
-            command(installed, "--port 8006 --app-dir C:\\evil"),
+            command(installed, &["--port", "8006", "--app-dir", "C:\\evil"]),
         ),
     ];
     let listen = |address: &str, port: u16, pid: u32| Listener {

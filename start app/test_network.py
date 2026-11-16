@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 from pathlib import Path
 import socket
 import ssl
@@ -314,26 +315,152 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
         environment = {"PATH": "/fixture/bin", "HOME": "/fixture/home",
                        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/fixture/bus",
                        "XDG_RUNTIME_DIR": "/fixture/runtime", "PROVIDER_TOKEN": "fixture-secret"}
-        for output, valid in ((b"Bearer host-fixture\n", True), (b"\n", False),
-                              (b"Bearer value\r\n", False), (b"a\nb\n", False),
-                              ("Bearer \u2603\n".encode(), False), (b"x" * 16386, False)):
-            reader = asyncio.StreamReader()
-            reader.feed_data(output)
-            reader.feed_eof()
-            process = SimpleNamespace(stdout=reader, wait=AsyncMock(return_value=0), returncode=0)
-            with (patch.dict(network.os.environ, environment, clear=True),
-                  patch.object(network.asyncio, "create_subprocess_exec", return_value=process) as spawn):
-                if valid:
-                    self.assertEqual(await network._lookup_authorization("https://example.test"),
-                                     "Bearer host-fixture")
-                else:
-                    with self.assertRaises(ValueError):
-                        await network._lookup_authorization("https://example.test")
-                self.assertEqual(spawn.call_args.args,
-                                 ("secret-tool", "lookup", "application", "ombp-start",
-                                  "origin", "https://example.test"))
-                self.assertNotIn("PROVIDER_TOKEN", spawn.call_args.kwargs["env"])
-                self.assertEqual(spawn.call_args.kwargs["stderr"], asyncio.subprocess.DEVNULL)
+        commands = {"linux": (("secret-tool", "lookup", "application", "ombp-start",
+                               "origin", "https://example.test"),
+                              {"PATH", "HOME", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "LANG"}),
+                    "darwin": (("/usr/bin/security", "find-generic-password", "-s", "ombp-start",
+                                "-a", "https://example.test", "-w"), {"HOME", "LANG"})}
+        for platform, (command, inherited) in commands.items():
+            for output, valid in ((b"Bearer host-fixture\n", True), (b"\n", False),
+                                  (b"Bearer value\r\n", False), (b"a\nb\n", False),
+                                  ("Bearer \u2603\n".encode(), False), (b"x" * 16386, False)):
+                reader = asyncio.StreamReader()
+                reader.feed_data(output)
+                reader.feed_eof()
+                process = SimpleNamespace(stdout=reader, wait=AsyncMock(return_value=0), returncode=0)
+                with (self.subTest(platform=platform, output=output[:24]),
+                      patch.object(network, "_PLATFORM", platform),
+                      patch.dict(network.os.environ, environment, clear=True),
+                      patch.object(network.asyncio, "create_subprocess_exec", return_value=process) as spawn):
+                    if valid:
+                        self.assertEqual(await network._lookup_authorization("https://example.test"),
+                                         "Bearer host-fixture")
+                    else:
+                        with self.assertRaises(ValueError):
+                            await network._lookup_authorization("https://example.test")
+                    self.assertEqual(spawn.call_args.args, command)
+                    self.assertEqual(set(spawn.call_args.kwargs["env"]), inherited)
+                    self.assertEqual(spawn.call_args.kwargs["stdin"], asyncio.subprocess.DEVNULL)
+                    self.assertEqual(spawn.call_args.kwargs["stderr"], asyncio.subprocess.DEVNULL)
+
+
+_FAKE_SECURITY = """#!{python}
+import json, os, sys, time
+from pathlib import Path
+root = Path(__file__).parent
+with (root / "calls.jsonl").open("a") as calls:
+    calls.write(json.dumps({{"argv": sys.argv[1:], "env": dict(os.environ)}}) + "\\n")
+state = json.loads((root / "keychain.json").read_text())
+if state.get("wait"):
+    (root / "started").touch()
+    while not (root / "release").exists():
+        time.sleep(0.01)
+if state.get("locked"):
+    sys.stderr.write("security: User interaction is not allowed.\\n")
+    sys.exit(36)
+arguments = sys.argv[1:]
+if arguments[:1] != ["find-generic-password"] or arguments[-1] != "-w":
+    sys.exit(2)
+value = state["items"].get(arguments[arguments.index("-s") + 1] + " " + arguments[arguments.index("-a") + 1])
+if value is None:
+    sys.stderr.write("security: The specified item could not be found in the keychain.\\n")
+    sys.exit(44)
+sys.stdout.buffer.write(bytes.fromhex(value))
+"""
+
+
+class KeychainTests(unittest.IsolatedAsyncioTestCase):
+    """The macOS lookup through a stand-in for /usr/bin/security that matches service and account exactly."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        executable = self.root / "security"
+        executable.write_text(_FAKE_SECURITY.format(python=sys.executable))
+        executable.chmod(0o700)
+        self.store({"ombp-start https://example.test": b"Bearer host-fixture\n",
+                    "ombp-start https://example.test:8443": b"Bearer other-port\n",
+                    "unrelated https://other.test": b"Bearer unrelated\n"})
+        for patcher in (patch.object(network, "_PLATFORM", "darwin"),
+                        patch.object(network, "_KEYCHAIN", str(executable)),
+                        patch.dict(network.os.environ, {"HOME": str(self.root), "PATH": "/nonexistent",
+                                                        "PROVIDER_TOKEN": "fixture-secret"}, clear=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def store(self, items, **state):
+        (self.root / "keychain.json").write_text(json.dumps(
+            {"items": {key: value.hex() for key, value in items.items()}, **state}))
+
+    def calls(self):
+        return [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
+
+    async def test_only_the_exact_service_and_origin_match(self):
+        self.assertEqual(await network._lookup_authorization("https://example.test"), "Bearer host-fixture")
+        self.assertEqual(await network._lookup_authorization("https://example.test:8443"), "Bearer other-port")
+        for target in ("https://other.test", "https://api.example.test", "http://example.test"):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                await network._lookup_authorization(target)
+        calls = self.calls()
+        self.assertEqual(calls[0]["argv"], ["find-generic-password", "-s", "ombp-start",
+                                            "-a", "https://example.test", "-w"])
+        for call in calls:
+            # The secret only ever crosses stdout: never argv or an inherited environment.
+            self.assertNotIn("Bearer", json.dumps(call["argv"]))
+            self.assertNotIn("PROVIDER_TOKEN", call["env"])
+            self.assertNotIn("PATH", call["env"])
+            self.assertEqual(call["env"]["HOME"], str(self.root))
+
+    async def test_denied_missing_locked_and_malformed_items_are_unavailable(self):
+        cases = {"missing": ({}, {}), "locked": ({"ombp-start https://example.test": b"Bearer x\n"}, {"locked": True})}
+        for value in (b"", b"\n", b"a\nb\n", b"Bearer \x7f\n", b"Bearer \xff\n", "Bearer \u2603\n".encode(),
+                      b"x" * 16385 + b"\n"):
+            cases[repr(value[:16])] = ({"ombp-start https://example.test": value}, {})
+        for name, (items, state) in cases.items():
+            self.store(items, **state)
+            with self.subTest(case=name), self.assertRaises(ValueError):
+                await network._lookup_authorization("https://example.test")
+        # Through the gateway every failure is the same generic response, without the item's value.
+        self.store({"ombp-start https://example.test": b"Bearer leaked\x01\n"})
+        policy = Policy(["https://example.test"])
+        policy.values["credential_origins"] = ["https://example.test"]
+        guard = network._Guard(policy)
+        guard.tunnels["client"] = "https://example.test"
+        selected = flow("https://example.test/", tls=True)
+        with patch.object(network, "_resolve_public", return_value="93.184.216.34"):
+            await guard.requestheaders(selected)
+        self.assertEqual((selected.response.status_code, selected.response.content),
+                         (502, b"Host credential unavailable.\n"))
+        self.assertNotIn("Authorization", selected.request.headers)
+
+    async def revoked_during_lookup(self, revoke):
+        self.store({"ombp-start https://example.test": b"Bearer host-fixture\n"}, wait=True)
+        policy = Policy(["https://example.test"])
+        policy.values["credential_origins"] = ["https://example.test"]
+        guard = network._Guard(policy)
+        guard.tunnels["client"] = "https://example.test"
+        selected = flow("https://example.test/", tls=True)
+        with patch.object(network, "_resolve_public", return_value="93.184.216.34"):
+            pending = asyncio.create_task(guard.requestheaders(selected))
+            for _ in range(500):
+                if (self.root / "started").exists():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue((self.root / "started").exists(), "Keychain lookup did not start")
+            revoke(policy.values)
+            (self.root / "release").touch()
+            await asyncio.wait_for(pending, 5)
+        self.assertNotIn("Authorization", selected.request.headers)
+        return selected
+
+    async def test_credential_revoked_during_lookup_is_never_injected(self):
+        selected = await self.revoked_during_lookup(lambda values: values.update(credential_origins=[]))
+        self.assertIsNone(selected.response)
+
+    async def test_website_revoked_during_lookup_is_denied(self):
+        selected = await self.revoked_during_lookup(lambda values: values.update(websites=[]))
+        self.assertEqual(selected.response.status_code, 403)
 
 
 class DNSTests(unittest.IsolatedAsyncioTestCase):
@@ -380,7 +507,7 @@ class DNSTests(unittest.IsolatedAsyncioTestCase):
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
     async def test_relay_and_half_close(self):
-        with tempfile.TemporaryDirectory(prefix="relay-") as directory:
+        with tempfile.TemporaryDirectory(prefix="relay-", dir=Path("/tmp").resolve()) as directory:
             path = str(Path(directory) / "echo.sock")
 
             async def echo(reader, writer):
@@ -423,11 +550,13 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
 
 class GatewayIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="gateway-")
+        # Keep actual Unix listeners within Darwin's pathname limit, independently of build TMPDIR.
+        self.directory = tempfile.TemporaryDirectory(prefix="gateway-", dir=Path("/tmp").resolve())
         self.addCleanup(self.directory.cleanup)
         self.policy = Policy()
         self.seen = []
         seen = self.seen
+        clients = self.upstream_clients = []
         streams = self.streams = SimpleNamespace(
             upload_started=threading.Event(), upload_continued=threading.Event(),
             upload_done=threading.Event(), download_release=threading.Event(),
@@ -462,6 +591,7 @@ class GatewayIntegrationTests(unittest.TestCase):
                         streams.download_done.set()
                     return
                 seen.append((self.path, self.headers.get("Authorization"), self.headers.get("Host")))
+                clients.append(self.client_address)
                 if self.path == "/redirect":
                     self.send_response(302)
                     self.send_header("Location", "https://blocked.test/")
@@ -567,6 +697,58 @@ class GatewayIntegrationTests(unittest.TestCase):
         response.close()
         sock.close()
         return result
+
+    def keepalive_request(self, sock, scheme, path="/", host="fixture.test"):
+        authority = f"{host}:{self.httpd.server_port}"
+        destination = path if scheme == "https" and host == "fixture.test" else f"{scheme}://{authority}{path}"
+        sock.sendall(f"GET {destination} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+        response = http.client.HTTPResponse(sock)
+        try:
+            response.begin()
+            return response.status, response.read()
+        finally:
+            response.close()
+
+    def keepalive_reuse(self, scheme):
+        if scheme == "https":
+            self.enable_tls()
+        self.policy.values["websites"] = [f"{scheme}://fixture.test:{self.httpd.server_port}"]
+        sock = self.open_socket(scheme)
+        self.assertEqual(self.keepalive_request(sock, scheme), (200, b"fixture response"))
+        # A DNS change cannot move an already vetted connection. More than five
+        # requests also catches exhausting mitmproxy's per-address connection cap.
+        with patch.object(network, "_resolve_public", side_effect=ValueError("DNS changed to private")) as resolve:
+            for index in range(1, 9):
+                self.assertEqual(self.keepalive_request(sock, scheme, f"/asset-{index}"),
+                                 (200, b"fixture response"))
+            resolve.assert_not_awaited()
+        self.assertEqual(len(self.upstream_clients), 9)
+        self.assertEqual(len(set(self.upstream_clients)), 1, "Requests opened new upstream sockets")
+        # Reuse never bypasses the live per-request policy check.
+        self.policy.values["websites"] = []
+        self.assertEqual(self.keepalive_request(sock, scheme, "/revoked"),
+                         (403, b"Website access denied by launcher policy.\n"))
+        self.assertEqual(len(self.upstream_clients), 9)
+        sock.close()
+
+    def test_http_keepalive_reuses_pinned_upstream_and_rechecks_policy(self):
+        self.keepalive_reuse("http")
+
+    def test_https_keepalive_reuses_pinned_upstream_and_rechecks_policy(self):
+        self.keepalive_reuse("https")
+
+    def test_reused_tls_tunnel_cannot_switch_to_another_allowed_host(self):
+        self.enable_tls()
+        port = self.httpd.server_port
+        self.policy.values["websites"] = [f"https://fixture.test:{port}", f"https://other.test:{port}"]
+        sock = self.open_socket("https")
+        self.assertEqual(self.keepalive_request(sock, "https"), (200, b"fixture response"))
+        with patch.object(network, "_resolve_public") as resolve:
+            self.assertEqual(self.keepalive_request(sock, "https", "/escape", host="other.test"),
+                             (403, b"Website access denied by launcher policy.\n"))
+            resolve.assert_not_awaited()
+        self.assertEqual(len(self.upstream_clients), 1)
+        sock.close()
 
     def test_websocket_forwards_without_retaining_messages_and_stops_on_revocation(self):
         authority = f"fixture.test:{self.httpd.server_port}"
@@ -812,7 +994,9 @@ class GatewayIntegrationTests(unittest.TestCase):
             f"#!{sys.executable}\nimport sys\n"
             "sys.stderr.write('fixture-secret\\n')\nsys.exit(1)\n")
         executable.chmod(0o700)
-        with patch.dict(network.os.environ, {"PATH": self.directory.name}):
+        # The same failing stand-in serves as Linux secret-tool (PATH) and macOS /usr/bin/security.
+        with (patch.dict(network.os.environ, {"PATH": self.directory.name}),
+              patch.object(network, "_KEYCHAIN", str(executable))):
             for method in ("POST", "PUT"):
                 with self.subTest(method=method):
                     status, body = self.body_error_request(method, authority)

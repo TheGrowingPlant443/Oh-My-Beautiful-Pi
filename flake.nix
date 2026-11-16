@@ -13,15 +13,25 @@
   outputs = { self, nixpkgs, fenix, crane, omsp }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
-      forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      # Current Nixpkgs dropped Intel Darwin; reuse OMSP's already locked
+      # final supported package set without changing other platforms' pins.
+      forAll = f: nixpkgs.lib.genAttrs systems (system:
+        f (if system == "x86_64-darwin" then
+          omsp.inputs.nixpkgs-darwin-x64.legacyPackages.${system}
+        else nixpkgs.legacyPackages.${system}));
       perSystem = pkgs:
         let
           inherit (pkgs) lib stdenv;
           craneLib = crane.mkLib pkgs;
+          # Intel's final Nixpkgs Bun predates the SDK's minimum; reuse the
+          # compatible Bun already pinned and built by OMSP for that platform.
+          bun = if stdenv.hostPlatform.system == "x86_64-darwin" then
+            omsp.packages.x86_64-darwin.sdk.bun
+          else pkgs.bun;
           sdk = import ./nix/omp-sdk { inherit pkgs; };
           sdkCommand = pkgs.writeShellScript "omp-manager-cli" ''
             unset PI_COMPILED
-            exec "''${BUN_BIN:-${pkgs.bun}/bin/bun}" ${sdk}/node_modules/@oh-my-pi/pi-coding-agent/src/cli.ts "$@"
+            exec "''${BUN_BIN:-${bun}/bin/bun}" ${sdk}/node_modules/@oh-my-pi/pi-coding-agent/src/cli.ts "$@"
           '';
           # PHP needs both upstream entry points, not the generic single-grammar binding.
           phpGrammar = pkgs.python3Packages.buildPythonPackage {
@@ -39,6 +49,18 @@
           # Tree-sitter grammars used by the System overview parser worker (bridge/source-index).
           sourceIndexPythonWith = extra: pkgs.python3.withPackages (ps:
             let
+              # Generic grammar bindings otherwise share the Mach-O ID "parser";
+              # dyld then resolves later languages against the first one loaded.
+              darwinBinding = grammar:
+                if stdenv.hostPlatform.isDarwin && grammar ? override then
+                  grammar.override (args: lib.optionalAttrs (args ? grammarDrv) {
+                    grammarDrv = args.grammarDrv.overrideAttrs (old: {
+                      postInstall = (old.postInstall or "") + ''
+                        install_name_tool -id "$out/parser" "$out/parser"
+                      '';
+                    });
+                  })
+                else grammar;
               # The visitors require these upstream schemas, not Nixpkgs' alternative grammars.
               jvmGrammar = language: version: src:
                 ps.tree-sitter-grammars."tree-sitter-${language}".override {
@@ -60,10 +82,17 @@
                   rev = "77dd60ea0a9003ce062c9728a513ffe1aaff8c82";
                   hash = "sha256-6jjK5rA/lEdsYDboU7wGfzEiRdZo44SrLlcgWci0xa4=";
                 });
+              } // lib.optionalAttrs (stdenv.hostPlatform.system == "x86_64-darwin") {
+                # Backport only the missing grammar source with Intel's builders.
+                tree-sitter-objc = ps.tree-sitter-grammars.tree-sitter-c.override {
+                  name = "tree-sitter-objc";
+                  grammarDrv = pkgs.tree-sitter.buildGrammar
+                    (pkgs.callPackage "${nixpkgs}/pkgs/by-name/tr/tree-sitter/grammars" {}).tree-sitter-objc;
+                };
               };
             in
             [ ps.tree-sitter ] ++ extra ps ++
-            map (name: grammarPackages.${name}) [
+            map (name: darwinBinding grammarPackages.${name}) [
               "tree-sitter-python" "tree-sitter-javascript" "tree-sitter-typescript" "tree-sitter-go"
               "tree-sitter-rust" "tree-sitter-java" "tree-sitter-groovy" "tree-sitter-c" "tree-sitter-cpp"
               "tree-sitter-ruby" "tree-sitter-c-sharp" "tree-sitter-kotlin" "tree-sitter-scala"
@@ -81,11 +110,37 @@
               npmRebuildFlags = [ "--ignore-scripts" ];
             };
           };
-          coverageCargoVendor = pkgs.rustPlatform.importCargoLock {
+          # OMBP bounds ancestor ignore rules at the nearest repository or home.
+          # Packaged builds and coverage must both compile this patched dependency.
+          ignoreLock = lib.findFirst (p: p.name == "ignore")
+            (throw "Cargo.lock has no ignore dependency")
+            (builtins.fromTOML (builtins.readFile ./src-tauri/Cargo.lock)).package;
+          boundedIgnore = (craneLib.downloadCargoPackage ignoreLock).overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [ ./nix/ignore-nearest-repository.patch ];
+          });
+          cargoVendor = craneLib.vendorCargoDeps {
+            cargoLock = ./src-tauri/Cargo.lock;
+            overrideVendorCargoPackage = p: drv: if p.name == "ignore" then boundedIgnore else drv;
+          };
+          baseCoverageVendor = pkgs.rustPlatform.importCargoLock {
             lockFile = ./src-tauri/Cargo.lock;
           };
+          # Coverage's offline directory source expects this flat layout; replace only ignore.
+          coverageCargoVendor = pkgs.runCommand "omp-coverage-cargo-vendor" { } ''
+            mkdir -p "$out"
+            ln -s ${baseCoverageVendor}/* "$out/"
+            rm "$out/ignore-${ignoreLock.version}"
+            ln -s ${boundedIgnore} "$out/ignore-${ignoreLock.version}"
+          '';
           # Keep coverage's compiler, profiler runtime and readers from one upstream toolchain.
-          coverageRust = fenix.packages.${stdenv.hostPlatform.system}.stable.withComponents [
+          coverageFenix = if stdenv.hostPlatform.system == "x86_64-darwin" then
+            import fenix {
+              inherit pkgs;
+              system = stdenv.hostPlatform.system;
+              inherit (fenix.inputs) rust-analyzer-src;
+            }
+          else fenix.packages.${stdenv.hostPlatform.system};
+          coverageRust = coverageFenix.stable.withComponents [
             "cargo" "rustc" "rust-std" "rustfmt" "clippy" "llvm-tools-preview"
           ];
           coverageLlvm = "${coverageRust}/lib/rustlib/${stdenv.hostPlatform.rust.rustcTarget}/bin";
@@ -140,7 +195,7 @@
               runHook postInstall
             '';
           };
-          runtimeTools = [ pkgs.bun pkgs.nodejs_24 pkgs.git sourceIndexPython ]
+          runtimeTools = [ bun pkgs.nodejs_24 pkgs.git sourceIndexPython ]
             ++ lib.optionals stdenv.hostPlatform.isLinux [ pkgs.libsecret pkgs.xdg-utils ];
           desktopItem = pkgs.makeDesktopItem {
             name = "omp-manager";
@@ -155,7 +210,8 @@
             version = "0.1.0";
             src = source;
             postUnpack = ''sourceRoot="$sourceRoot/src-tauri"'';
-            cargoLock = pkgs.writeText "Cargo.lock" (builtins.readFile ./src-tauri/Cargo.lock);
+            cargoLock = ./src-tauri/Cargo.lock;
+            cargoVendorDir = cargoVendor;
             # Both cache and application must enable the same embedded-asset feature.
             cargoExtraArgs = "--locked --features tauri/custom-protocol";
             nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake pkgs.makeWrapper ]
@@ -174,6 +230,12 @@
           package = craneLib.buildPackage (rustArgs // {
             inherit cargoArtifacts;
             preBuild = ''
+              ${lib.optionalString stdenv.hostPlatform.isDarwin ''
+                # Tauri's permission manifests contain absolute OUT_DIR paths.
+                # Darwin Nix builders use different temporary roots for the
+                # dependency cache and this build; regenerate only these crates.
+                cargo clean --release -p tauri -p tauri-plugin-fs -p tauri-plugin-dialog
+              ''}
               cp -r ${frontend} ../dist
             '';
             postInstall = lib.optionalString stdenv.hostPlatform.isLinux ''
@@ -193,6 +255,7 @@
                 <key>CFBundleName</key><string>OMP Manager</string>
                 <key>CFBundlePackageType</key><string>APPL</string>
                 <key>CFBundleShortVersionString</key><string>0.1.0</string>
+                <key>LSMinimumSystemVersion</key><string>15.0</string>
                 <key>NSHighResolutionCapable</key><true/>
               </dict></plist>
               PLIST
@@ -215,7 +278,13 @@
               platforms = systems;
             };
           });
-          omspSdk = omsp.packages.${stdenv.hostPlatform.system}.sdk;
+          # Upstream's thin-LTO profile lowers Linux native build memory while
+          # preserving release optimization, native features and SDK stamping.
+          # Override the package before selecting its SDK so both share the addon.
+          omspUpstream = omsp.packages.${stdenv.hostPlatform.system}.omsp;
+          omspSdk = (if stdenv.hostPlatform.isLinux then
+            omspUpstream.override { withFatLto = false; }
+          else omspUpstream).sdk;
           omspSdkDir = "${omspSdk}/packages/coding-agent";
           omspBun = "${omspSdk.bun}/bin/bun";
           omspCommand = pkgs.writeShellScript "omsp-manager-cli" ''
@@ -247,11 +316,11 @@
           };
         in
         {
-          inherit package frontend sdk omspPackage;
+          inherit package frontend sdk omspPackage sdkCommand omspCommand;
           shell = pkgs.mkShell ({
             packages = [
               coverageRust pkgs.pkg-config pkgs.cmake
-              pkgs.nodejs_24 pkgs.bun pkgs.git coveragePython coverageTool
+              pkgs.nodejs_24 bun pkgs.git coveragePython coverageTool
             ] ++ lib.optionals stdenv.hostPlatform.isLinux (linuxLibs ++ [ pkgs.patchelf pkgs.xdg-utils pkgs.libsecret ])
               ++ lib.optionals stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
             OMP_SYSTEM_OVERVIEW_PYTHON = "${sourceIndexPython}/bin/python3";
@@ -259,6 +328,7 @@
             OMP_BIN = "${sdkCommand}";
             OMP_COVERAGE_PYTHON = "${coveragePython}/bin/python3";
             OMP_TEST_NODE_MODULES = "${testNodeModules}/node_modules";
+            OMP_TEST_REQUIRE_ALL_GRAMMARS = "1";
             LLVM_COV = "${coverageLlvm}/llvm-cov";
             LLVM_PROFDATA = "${coverageLlvm}/llvm-profdata";
             OMP_COVERAGE_CARGO = "${coverageRust}/bin/cargo";
@@ -280,6 +350,15 @@
         frontend = values.frontend;
         sdk = values.sdk;
         omsp = values.omspPackage;
+        # Standalone agent CLIs share the application's SDK and Bun pins.
+        agent-omp = pkgs.runCommand "ombp-agent-omp" { } ''
+          mkdir -p "$out/bin"
+          ln -s ${values.sdkCommand} "$out/bin/omp"
+        '';
+        agent-omsp = pkgs.runCommand "ombp-agent-omsp" { } ''
+          mkdir -p "$out/bin"
+          ln -s ${values.omspCommand} "$out/bin/omsp"
+        '';
       });
       apps = forAll (pkgs: {
         default = {

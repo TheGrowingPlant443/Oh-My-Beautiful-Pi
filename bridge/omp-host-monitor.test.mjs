@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { cp, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -10,6 +10,7 @@ import { MAX_MONITOR_FRAME, MONITOR_TOOL, monitorParameters } from './omp-host-m
 import { installSrsBridge } from './omp-srs.mjs';
 import { MONITOR_BLOCK, MONITOR_GUARD_ERROR } from './omp-visualization-guard.mjs';
 import { controlAllowed } from './omp-manager.mjs';
+import { prepareSdkNatives } from './fixtures/sdk-natives.mjs';
 
 const REQUEST = '11111111-1111-4111-8111-111111111111';
 const OTHER_REQUEST = '22222222-2222-4222-8222-222222222222';
@@ -342,9 +343,7 @@ test('installed SDK compaction, willContinue and automatic continuation keep mon
   const root = await mkdtemp(path.join(os.homedir(), '.omp-monitor-compaction-'));
   try {
     await mkdir(path.join(root, 'agent'), { recursive: true });
-    const { version } = JSON.parse(await readFile(path.join(sdk, 'package.json'), 'utf8'));
-    const nativeRoot = path.join(root, 'natives');
-    await cp(path.join(process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'), version), path.join(nativeRoot, version), { recursive: true });
+    const nativeRoot = await prepareSdkNatives(sdk, root);
     // PI_CONFIG_DIR is relative to the real home; never override USERPROFILE.
     const config = path.relative(os.homedir(), path.join(root, 'config'));
     assert.equal(config.split(path.sep).includes('..'), false);

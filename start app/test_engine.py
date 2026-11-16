@@ -465,7 +465,8 @@ class SeedTests(unittest.TestCase):
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        # These fixtures bind Unix sockets; a Nix shell's nested TMPDIR can exceed sun_path.
+        self.temporary = tempfile.TemporaryDirectory(dir=Path("/tmp").resolve())
         self.directory = Path(self.temporary.name)
         self.gateway = engine.EngineGateway(None, self.directory, {IMAGE}, 9100, None)
         self.gateway.upstream_path.parent.mkdir()

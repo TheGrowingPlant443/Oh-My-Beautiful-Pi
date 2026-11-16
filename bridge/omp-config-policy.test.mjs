@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { cp, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { configPolicyFiles } from './omp-config-policy.mjs';
+import { prepareSdkNatives } from './fixtures/sdk-natives.mjs';
 
 test('ordered setup slots retain defaults and native overlay precedence across selection and restart', () => {
   const root = path.resolve('app');
@@ -33,9 +34,7 @@ test('native Settings, actual model changes and scoped setup resources stay offl
   const root = await mkdtemp(path.join(os.homedir(), '.omp-config-policy-'));
   try {
     await mkdir(path.join(root, 'agent'), { recursive: true });
-    const { version } = JSON.parse(await readFile(path.join(sdk, 'package.json'), 'utf8'));
-    const nativeRoot = path.join(root, 'natives');
-    await cp(path.join(process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'), version), path.join(nativeRoot, version), { recursive: true });
+    const nativeRoot = await prepareSdkNatives(sdk, root);
     const config = path.relative(os.homedir(), path.join(root, 'config'));
     assert.ok(!config.split(path.sep).includes('..'));
     const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [fileURLToPath(new URL('./fixtures/config-policy-sdk.mjs', import.meta.url))], {

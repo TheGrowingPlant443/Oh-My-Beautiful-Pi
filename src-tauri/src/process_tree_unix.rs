@@ -195,23 +195,35 @@ fn members(session: u32) -> Result<Vec<i32>, String> {
         .collect())
 }
 
-/// Retire every process still in a session we created, including shell job-control groups.
-/// The caller holds the root child unreaped during signal delivery.
-pub(crate) fn kill_session(session: u32) -> Result<(), String> {
+/// One non-waiting retirement pass. `false` means members remain, including
+/// unsignalable ones; only an empty verified session permits reaping its leader.
+/// The caller must keep the owned leader unreaped throughout these passes.
+pub(crate) fn try_kill_session(session: u32) -> Result<bool, String> {
     if session <= 1 {
         return Err("Refusing to signal an invalid session".into());
     }
+    let live = members(session)?;
+    if live.is_empty() {
+        return Ok(true);
+    }
+    for pid in live {
+        // SAFETY: these are current members of the dedicated session, whose
+        // unreaped leader still reserves its identity. A failed signal is not
+        // retirement: the member must disappear before we report success.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    Ok(false)
+}
+
+/// Retire every process still in a session we created, including shell job-control groups.
+/// The caller holds the root child unreaped during signal delivery.
+pub(crate) fn kill_session(session: u32) -> Result<(), String> {
     let deadline = Instant::now() + RETIRE_BOUND;
     loop {
-        let live = members(session)?;
-        if live.is_empty() {
+        if try_kill_session(session)? {
             return Ok(());
-        }
-        for pid in live {
-            // SAFETY: these are current members of the dedicated session, never arbitrary ancestry guesses.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
         }
         if Instant::now() >= deadline {
             return Err("Process-session retirement could not be verified".into());

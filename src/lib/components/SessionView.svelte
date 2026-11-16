@@ -65,6 +65,7 @@
     try { await action(); } finally { busy = false; }
   }
   const HEADLESS_RESTART = "browser_headless_restart_required";
+  const browserLocation = $derived(typeof navigator !== "undefined" && /Win/i.test(navigator.platform) && $appSettings.browserEmbedded ? "inside the app" : "in an external browser window");
   async function openBrowser(): Promise<void> {
     const { id, generation } = instance;
     busy = true;
@@ -73,7 +74,7 @@
       try { info = await api.openSessionBrowser(id, generation, false); }
       catch (error) {
         if (errorText(error).trim() !== HEADLESS_RESTART) throw error;
-        if (!await confirmDanger("This session's headless browser must restart to show it inside the app. Its open tabs will be closed. Continue?")) return;
+        if (!await confirmDanger(`This session's headless browser must restart to show it ${browserLocation}. Its open tabs will be closed. Continue?`)) return;
         info = await api.openSessionBrowser(id, generation, true);
       }
       if (instance.id === id && instance.generation === generation) {
@@ -156,7 +157,7 @@
       <span class="pill">{currentBrowser.state === "error" ? "Browser error" : currentBrowser.state === "opening" ? "Opening browser…" : currentBrowser.headless ? "Browser: headless" : "Browser: external"}</span>
     {/if}
     <button disabled={busy || nativeHubDisabled(instance)} title={instance.bridgeReady && !instance.capabilities?.agentHub ? "Reopen this session with a compatible OMP version." : "Open this session's native Agent Hub"} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
-    {#if showBrowser}<button disabled={busy || !live} title={live ? "Show this session's browser next to the terminal" : "Start this session first"} onclick={openBrowser}>Browser</button>{/if}
+    {#if showBrowser}<button disabled={busy || !live} title={live ? `Show this session's browser ${browserLocation}` : "Start this session first"} onclick={openBrowser}>Browser</button>{/if}
     {#if showBrowser}<button class:active={terminalOpen} aria-pressed={terminalOpen} title="Your own shell, the AI's command history and its live commands next to the terminal" onclick={toggleTerminal}>Terminal</button>{/if}
     {#if instance.kind === "architect" && onDependencyTree}<button title="Choose a project and diagram its dependencies" onclick={() => onDependencyTree(instance.id)}>Dependency tree</button>{/if}
     {#if instance.kind === "architect" && onSystemOverview}<button title="Choose a project and view its function, file and system diagrams" onclick={() => onSystemOverview(instance.id)}>System overview</button>{/if}

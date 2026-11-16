@@ -1,10 +1,12 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import sys
 
 import catalog
 from catalog import detect_gpu, find_folders, host_program, installed_programs, resolve_program, user_folders
+import packages
 
 
 class CatalogTests(unittest.TestCase):
@@ -191,6 +193,54 @@ class CatalogTests(unittest.TestCase):
                                   profile_bins=[], application_dirs=[applications])
         self.assertEqual(rows, [])
         self.assertFalse(marker.exists())
+
+
+class PackageCatalogTests(unittest.TestCase):
+    def test_isolated_target_is_linux_of_the_same_cpu(self):
+        # Apple Silicon Darwin reports arm64; its isolated programs run in aarch64 Linux.
+        for machine, system in (("arm64", "aarch64-linux"), ("aarch64", "aarch64-linux"),
+                                ("x86_64", "x86_64-linux"), ("riscv64", ""), ("", "")):
+            with self.subTest(machine=machine):
+                self.assertEqual(packages.linux_system(machine), system)
+
+    def test_metadata_describes_every_choice_and_language_server(self):
+        found = catalog.package_catalog()
+        self.assertEqual(found["system"], packages.SYSTEM)
+        ids = [item["id"] for item in found["packages"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(sorted(item["id"] for item in found["packages"] if item["default"]),
+                         ["basic-tools", "chromium", "gh", "ssh"])
+        for item in found["packages"]:
+            with self.subTest(package=item["id"]):
+                self.assertTrue(all(isinstance(item[key], str) and item[key] for key in ("label", "group", "description")))
+                self.assertTrue(item["executables"])
+                self.assertTrue(all(isinstance(name, str) and name and "/" not in name for name in item["executables"]))
+        self.assertEqual({item["id"]: item["systems"] for item in found["packages"] if "systems" in item},
+                         {"sourcekit-lsp": ["x86_64-linux"], "swift": ["x86_64-linux"]})
+        commands = {name for item in found["packages"] for name in item["executables"]}
+        self.assertEqual(found["language_servers"], sorted(set(found["language_servers"])))
+        self.assertLessEqual(set(found["language_servers"]), commands)
+        self.assertNotIn("cargo", found["language_servers"])  # Bundled compilers are not language servers.
+
+    def test_metadata_consumers_cannot_change_the_next_catalog(self):
+        found = catalog.package_catalog()
+        found["packages"][0]["executables"].append("injected")
+        found["packages"].clear()
+        found["language_servers"].append("injected")
+        again = catalog.package_catalog()
+        self.assertNotIn("injected", again["packages"][0]["executables"])
+        self.assertNotIn("injected", again["language_servers"])
+
+    def test_host_catalog_keeps_discovery_and_adds_package_metadata(self):
+        program = {"name": "tool", "path": "/nix/store/x-tool/bin/tool"}
+        with patch.object(catalog, "detect_gpu", return_value="none"), \
+                patch.object(catalog, "user_folders", return_value=[{"name": "Home", "path": "/home/u"}]), \
+                patch.object(catalog, "installed_programs", return_value=[program]):
+            found = catalog.catalog()
+        self.assertEqual((found["gpu"], found["folders"], found["programs"]),
+                         ("none", [{"name": "Home", "path": "/home/u"}], [program]))
+        self.assertEqual({key: found[key] for key in ("system", "packages", "language_servers")},
+                         catalog.package_catalog())
 
 
 

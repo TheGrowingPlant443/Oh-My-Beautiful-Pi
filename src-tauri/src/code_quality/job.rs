@@ -307,10 +307,10 @@ mod tests {
         fn image_exists(&self, _: &str, _: &RunControl) -> Result<bool> {
             Ok(true)
         }
-        fn pull(&self, _: &str, _: &RunControl) -> Result<()> {
+        fn pull(&self, _: &str, _: Option<&str>, _: &RunControl) -> Result<()> {
             Ok(())
         }
-        fn build_image(&self, _: &str, _: &Path, _: &RunControl) -> Result<()> {
+        fn build_image(&self, _: &str, _: &Path, _: Option<&str>, _: &RunControl) -> Result<()> {
             Ok(())
         }
         fn network_create(&self, _: &str, _: &[(String, String)], _: &RunControl) -> Result<()> {

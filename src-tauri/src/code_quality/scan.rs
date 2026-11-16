@@ -835,12 +835,16 @@ impl CodeQualityService {
         let probe = engine.probe(&control)?;
         // Alternate and Enterprise also run owned scanner containers. Persist the runtime before
         // creating one so shutdown/handover can verify cleanup even after a failed scan or crash.
+        let credential_generation = self.credential_refresh_generation.load(Ordering::Acquire);
         self.set_possibly_running(
             &job.config.runtime,
             Some(&probe.fingerprint),
             job.config.community_port,
             true,
         )?;
+        if self.credential_refresh_generation.load(Ordering::Acquire) != credential_generation {
+            let _ = self.schedule_credential_refresh();
+        }
         self.scan_phase(id, "Snapshotting the project");
         let snapshot = snapshot::create_snapshot(
             &job.folder,

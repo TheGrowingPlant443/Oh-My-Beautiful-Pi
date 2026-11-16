@@ -159,6 +159,7 @@ impl CodeQualityService {
         running: bool,
     ) -> Result<()> {
         let mut resources = store::load_resources(&self.paths)?;
+        let previous_fingerprint = resources.runtime(runtime).map(|record| record.fingerprint.clone());
         match resources.runtime_mut(runtime) {
             Some(record) => {
                 record.possibly_running = running;
@@ -174,7 +175,14 @@ impl CodeQualityService {
                 port,
             }),
         }
-        store::save_resources(&self.paths, &resources)
+        let mut inner = self.inner.lock();
+        store::save_resources(&self.paths, &resources)?;
+        if &inner.file.config.runtime == runtime
+            && previous_fingerprint.as_deref() != resources.runtime(runtime).map(|record| record.fingerprint.as_str())
+        {
+            self.invalidate_credentials(&mut inner);
+        }
+        Ok(())
     }
 
     // ---- public operations ----------------------------------------------------------------
@@ -241,6 +249,7 @@ impl CodeQualityService {
             inner.prerequisites = prerequisites;
             inner.options = options;
         }
+        let _ = self.schedule_credential_refresh();
         Ok(self.state_after(gate))
     }
 
@@ -497,22 +506,25 @@ impl CodeQualityService {
         Ok(self.state_after(gate))
     }
 
-    /// App start: only recovers interrupted jobs (files); the analyzer starts here only when the user
-    /// enabled "Start code quality when OMP Manager starts", otherwise when Code quality is opened.
+    /// Desktop startup never waits for credentials or starts an analyzer unless explicitly enabled.
     pub fn reconcile_on_start(self: &Arc<Self>) {
-        if self.refresh_ownership().is_err() || !self.owns_resources() {
-            return;
-        }
-        let launch = {
-            let inner = self.inner.lock();
-            inner.fatal.is_none() && inner.file.activated && inner.file.start_at_launch
-        };
-        if !launch {
-            return;
-        }
         let svc = self.clone();
-        let _ = self.spawn_worker("code-quality-launch", move || {
-            let _ = svc.enter();
+        let _ = self.spawn_worker("code-quality-startup", move || {
+            let was_owner = svc.owns_resources();
+            if svc.refresh_ownership().is_err() || !svc.owns_resources() {
+                return;
+            }
+            // Acquisition schedules its own refresh; initial ownership needs a startup check.
+            if was_owner {
+                let _ = svc.schedule_credential_refresh();
+            }
+            let launch = {
+                let inner = svc.inner.lock();
+                inner.fatal.is_none() && inner.file.activated && inner.file.start_at_launch
+            };
+            if launch {
+                let _ = svc.enter();
+            }
         });
     }
 
@@ -551,7 +563,7 @@ impl CodeQualityService {
     }
 
     fn run_transition(
-        &self,
+        self: &Arc<Self>,
         gate: Gate,
         target: QualityConfig,
         credential: Option<QualityCredentialUpdate>,
@@ -560,7 +572,11 @@ impl CodeQualityService {
             let mut inner = self.inner.lock();
             inner.requested = Some(target.clone());
         }
-        match self.apply(&gate, &target, credential.as_ref()) {
+        let outcome = self.apply(&gate, &target, credential.as_ref());
+        // A failed start may still have replaced a recorded daemon identity. Refresh the committed
+        // targets on every outcome, without mixing presence failures into the operation's error.
+        let _ = self.schedule_credential_refresh();
+        match outcome {
             Ok(Outcome::Ready) => {
                 self.inner.lock().suspended = false;
                 gate.finish(QualityPhase::Idle, None);
@@ -642,7 +658,6 @@ impl CodeQualityService {
             self.inner.lock().suspended = false;
             // Re-confirming the committed selection (opening the view, Start / retry) is not a change.
             self.inner.lock().effective = Some(target.mode);
-            self.refresh_credentials();
             return Ok(());
         }
         file.config = target.clone();
@@ -651,11 +666,11 @@ impl CodeQualityService {
         store::save_config(&self.paths, &file)?;
         {
             let mut inner = self.inner.lock();
+            self.invalidate_credentials(&mut inner);
             inner.file = file;
             inner.effective = Some(target.mode);
             inner.suspended = false;
         }
-        self.refresh_credentials();
         Ok(())
     }
 
@@ -716,7 +731,7 @@ impl CodeQualityService {
 
     /// Token-only change on an unchanged healthy configuration: no restart.
     fn credential_only(
-        &self,
+        self: &Arc<Self>,
         gate: Gate,
         config: &QualityConfig,
         update: &QualityCredentialUpdate,
@@ -754,7 +769,7 @@ impl CodeQualityService {
         })();
         match outcome {
             Ok(()) => {
-                self.refresh_credentials();
+                let _ = self.schedule_credential_refresh();
                 Ok(self.state_after(gate))
             }
             Err(error) => {
@@ -1036,7 +1051,7 @@ impl CodeQualityService {
             if !engine.image_exists(image, &gate.control)? {
                 gate.phase(QualityPhase::Pulling);
                 gate.say(&format!("Pulling {image}"));
-                engine.pull(image, &gate.control)?;
+                engine.pull(image, None, &gate.control)?;
             }
         }
         gate.phase(QualityPhase::Starting);
@@ -1155,7 +1170,6 @@ impl CodeQualityService {
         match created {
             Ok(token) => match self.secrets.write(&token_target, &token) {
                 Ok(()) => {
-                    self.refresh_credentials();
                     gate.say("Created the SonarQube scan token and saved it in the operating system credential store.");
                 }
                 Err(error) => gate.say(&format!("Could not save the SonarQube scan token: {error}")),
@@ -1173,6 +1187,7 @@ impl CodeQualityService {
         gate: &Gate,
     ) -> Result<()> {
         let mut resources = store::load_resources(&self.paths)?;
+        let identity_changed = resources.runtime(runtime).is_none_or(|record| record.fingerprint != fingerprint);
         match resources.runtime_mut(runtime) {
             Some(record) if record.fingerprint == fingerprint => {
                 record.port = port;
@@ -1192,7 +1207,12 @@ impl CodeQualityService {
                 port,
             }),
         }
-        store::save_resources(&self.paths, &resources)
+        let mut inner = self.inner.lock();
+        store::save_resources(&self.paths, &resources)?;
+        if identity_changed && &inner.file.config.runtime == runtime {
+            self.invalidate_credentials(&mut inner);
+        }
+        Ok(())
     }
 
     fn ensure_servers(

@@ -131,6 +131,23 @@ test("a partial attempt can be viewed explicitly without replacing the selected 
   assert.equal(effectiveIndex(h.snapshot()).snapshotId, "snap-1");
 });
 
+test("without a complete index the saved partial one is shown, can generate, and is not indexed again on open", async () => {
+  const h = setup();
+  h.state.selection = { selected: null, latestAttempt: job("partial", { snapshotId: "snap-p", jobId: "job-p" }) };
+  await h.store.enter({ folder: "C:/repo" });
+  await h.flush();
+  assert.equal(effectiveIndex(h.snapshot()).snapshotId, "snap-p");
+  assert.equal(count(h.calls, "start"), 0);
+  await h.store.generateSystem(false);
+  assert.equal(h.calls.find(call => call[0] === "request")[3], "snap-p");
+  // A later complete index takes over again.
+  h.state.selection = { selected: complete("snap-2"), latestAttempt: complete("snap-2") };
+  h.state.read = () => complete("snap-2");
+  await h.store.refreshIndex();
+  await h.tick();
+  assert.equal(effectiveIndex(h.snapshot()).snapshotId, "snap-2");
+});
+
 test("late index, level and search results of a previous folder are dropped after a folder switch", async () => {
   const gates = [];
   const h = setup();

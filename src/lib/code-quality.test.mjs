@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultQualityConfig, modeSelectors, selectorMode, QualityClient, qualityLocked, QUALITY_BUSY, QualityGeneration, QualityViewEntry, QualityRevealLifetime, setupAction, filterQualityFindings, findingTools, mergeFindingAttribution, qualityPage, scanPresentation, parseQualityPreferences, pageScreen, scanAction, installVisible, featuresVisible, countBySeverity, qualityFolderKey, STARTING_TEXT } from "./code-quality.ts";
+import { credentialCheckPending, defaultQualityConfig, modeSelectors, selectorMode, QualityClient, qualityLocked, QUALITY_BUSY, QualityGeneration, QualityViewEntry, QualityRevealLifetime, setupAction, filterQualityFindings, findingTools, mergeFindingAttribution, qualityPage, scanPresentation, parseQualityPreferences, pageScreen, scanAction, installVisible, featuresVisible, countBySeverity, qualityFolderKey, STARTING_TEXT } from "./code-quality.ts";
 
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 function state(extra = {}) {
-  return { revision: 0, config: defaultQualityConfig(), effectiveMode: null, phase: "idle", busy: false, operationId: null, requestedConfig: null, error: null,
-    activated: false, community: { running: false, url: null, runtimeId: null }, credentials: { community: false, enterprise: false }, rules: { manifestHash: "pack", licenseHash: "license", acknowledged: false, licenseText: "terms" }, prerequisites: [], options: { wslDistros: [], podmanConnections: [], wingetAvailable: false, podmanAppConnection: null, wslFeaturesMissing: false }, diagnostics: [], unresolved: [], activeScanId: null,
+  return { revision: 0, config: defaultQualityConfig(), effectiveMode: null, phase: "idle", busy: false, operationId: null, requestedConfig: null, error: null, fatal: false,
+    activated: false, community: { running: false, url: null, runtimeId: null }, credentials: { checked: false, error: null, community: false, enterprise: false }, rules: { manifestHash: "pack", licenseHash: "license", acknowledged: false, licenseText: "terms" }, prerequisites: [], options: { wslDistros: [], podmanConnections: [], wingetAvailable: false, podmanAppConnection: null, wslFeaturesMissing: false }, diagnostics: [], unresolved: [], activeScanId: null,
     ownership: { status: "owned", ownerPid: 42 }, suspended: false, setup: { needed: false, installRequired: false, resume: false, steps: [] }, startAtLaunch: false, ...extra };
 }
 function harness(read = async () => state()) {
@@ -122,7 +122,7 @@ test("only nonsecret folder and filter preferences are restored", () => {
   assert.deepEqual(parseQualityPreferences("invalid"), { folder: "", tool: "", severity: "", text: "" });
 });
 
-const ready = (extra = {}) => state({ activated: true, effectiveMode: "sonarqubeCommunity", ...extra });
+const ready = (extra = {}) => state({ activated: true, effectiveMode: "sonarqubeCommunity", credentials: { checked: true, error: null, community: true, enterprise: true }, ...extra });
 const step = (id, value) => ({ id, label: id, state: value });
 
 test("page screen follows the evaluation order from loading to scan", () => {
@@ -145,7 +145,7 @@ test("page screen follows the evaluation order from loading to scan", () => {
 });
 
 test("scan action blocks until the recipe is ready and labels approval", () => {
-  const base = { quality: state(), preparationReady: true, selectionNeeded: false, entryNeeded: false, requiresConsent: false, activeScanId: null, locked: false };
+  const base = { quality: ready(), preparationReady: true, selectionNeeded: false, entryNeeded: false, requiresConsent: false, activeScanId: null, locked: false };
   assert.deepEqual(scanAction(base), { label: "Scan project", kind: "scan", reason: null });
   assert.deepEqual(scanAction({ ...base, requiresConsent: true }), { label: "Approve recipe and scan", kind: "scan", reason: null });
   assert.equal(scanAction({ ...base, preparationReady: false }).reason, "Preparing…");
@@ -155,6 +155,54 @@ test("scan action blocks until the recipe is ready and labels approval", () => {
   assert.deepEqual(scanAction({ ...base, activeScanId: "scan-1" }), { label: "Cancel scan", kind: "cancel", reason: null });
   assert.equal(scanAction({ ...base, locked: true }).kind, "blocked");
   assert.equal(scanAction({ ...base, quality: null }).kind, "blocked");
+});
+
+test("pending and failed presence never means a missing token or a ready Sonar scan", () => {
+  const pending = ready({
+    platform: "macos",
+    config: { ...defaultQualityConfig(), runtime: { kind: "dockerDesktop" } },
+    credentials: { checked: false, error: null, community: false, enterprise: false },
+    prerequisites: [{ runtime: { kind: "dockerDesktop" }, installed: true, ready: true, needsRestart: false, message: null }],
+    setup: { needed: false, installRequired: false, resume: false, steps: [step("runtime", "done"), step("credentials", "pending"), step("server", "done"), step("token", "pending")] },
+  });
+  const input = { quality: pending, preparationReady: true, selectionNeeded: false, entryNeeded: false, requiresConsent: false, activeScanId: null, locked: false };
+  assert.equal(pageScreen(pending, true), "credentials");
+  assert.equal(credentialCheckPending(pending), true);
+  assert.equal(pageScreen({ ...pending, platform: "linux" }, true), "credentials");
+  const stillNeedsRuntime = { ...pending, setup: { ...pending.setup, needed: true, steps: pending.setup.steps.map(item => item.id === "runtime" ? step("runtime", "pending") : item) } };
+  assert.equal(pageScreen(stillNeedsRuntime, true), "setup", "real prerequisites are not hidden by a credential check");
+  const ordinaryError = { ...pending, error: "A newer scan failure" };
+  assert.equal(credentialCheckPending(ordinaryError), true, "an ordinary error does not suppress an admitted check");
+  assert.equal(pageScreen(ordinaryError, true), "credentials");
+  assert.deepEqual(scanAction(input), { label: "Scan project", kind: "blocked", reason: "Checking credentials…" });
+  const unavailable = { ...pending, credentials: { ...pending.credentials, checked: true, error: "Credential store unavailable" }, error: "Newer scan failure",
+    setup: { ...pending.setup, needed: true, steps: pending.setup.steps.map(item => ["credentials", "token"].includes(item.id) ? step(item.id, "blocked") : item) } };
+  assert.equal(scanAction({ ...input, quality: unavailable }).reason, "Credential store unavailable");
+  assert.equal(unavailable.error, "Newer scan failure");
+  const missing = { ...pending, credentials: { ...pending.credentials, checked: true },
+    setup: { ...pending.setup, needed: true, steps: pending.setup.steps.map(item => item.id === "credentials" ? step("credentials", "done") : item) } };
+  assert.equal(scanAction({ ...input, quality: missing }).reason, "A saved user token is required.");
+  assert.equal(scanAction({ ...input, activeScanId: "scan-1" }).kind, "cancel", "pending presence never prevents cancellation");
+  for (const status of ["otherProcess", "handedOff", "transferring"]) {
+    const nonowner = { ...pending, ownership: { status, ownerPid: 7 } };
+    assert.equal(pageScreen(nonowner, true), "ownership");
+    assert.deepEqual(scanAction({ ...input, quality: nonowner }), { label: "Scan project", kind: "blocked", reason: null });
+    assert.equal(credentialCheckPending(nonowner), false);
+  }
+  const enterprise = { ...pending, config: { ...pending.config, mode: "sonarqubeEnterprise" }, effectiveMode: "sonarqubeEnterprise", setup: { ...pending.setup, steps: pending.setup.steps.filter(item => item.id !== "token") } };
+  assert.equal(pageScreen(enterprise, true), "credentials");
+  assert.equal(scanAction({ ...input, quality: enterprise }).kind, "blocked", "unchecked flags never authorize readiness");
+  for (const credentials of [pending.credentials, unavailable.credentials]) {
+    const alternate = { ...pending, config: { ...pending.config, mode: "alternate" }, effectiveMode: "alternate", credentials,
+      setup: { needed: false, installRequired: false, resume: false, steps: [step("runtime", "done"), step("server", "done")] } };
+    assert.equal(pageScreen(alternate, true), "scan", "Alternate has no credential setup prerequisite");
+    assert.equal(scanAction({ ...input, quality: alternate }).kind, "scan", "the alternate analyzer does not use Sonar tokens");
+  }
+  const fatal = { ...pending, fatal: true, error: "Invalid code quality config.json", effectiveMode: null,
+    setup: { ...pending.setup, needed: true, steps: pending.setup.steps.map(item => item.id === "server" ? step("server", "pending") : item) } };
+  assert.equal(credentialCheckPending(fatal), false, "fatal state prevented the check from being admitted");
+  assert.equal(pageScreen(fatal, true), "failed");
+  assert.deepEqual(scanAction({ ...input, quality: fatal }), { label: "Scan project", kind: "blocked", reason: fatal.error });
 });
 
 test("install and Windows feature controls appear only after a probe proves them necessary", () => {

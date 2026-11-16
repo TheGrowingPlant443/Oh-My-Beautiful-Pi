@@ -6,7 +6,7 @@ import {createServer} from 'node:http';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {fileURLToPath} from 'node:url';
-import {mkdtemp,rm} from 'node:fs/promises';
+import {chmod,mkdir,mkdtemp,rm,writeFile} from 'node:fs/promises';
 import os from 'node:os';
 
 test('restored terminal IDs cannot collide or traverse the persistent profile root',()=>{
@@ -144,8 +144,29 @@ test('Unix resolution honors explicit browsers, absolute PATH order, Nix profile
   assert.equal(await resolveInstalledChromium({env:{HOME:'/home/test',PATH:''},platform:'linux',exists:async file=>file==='/home/test/.nix-profile/bin/chromium',cached:never}),'/home/test/.nix-profile/bin/chromium');
   const app='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
   assert.equal(await resolveInstalledChromium({env:{PATH:''},platform:'darwin',exists:async file=>file===app,cached:never}),app);
+  const userApp='/Users/Local User/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  assert.equal(await resolveInstalledChromium({env:{HOME:'/Users/Local User',PATH:''},platform:'darwin',exists:async file=>file===userApp,cached:never}),userApp);
   assert.equal(await resolveInstalledChromium({env:{...env,PUPPETEER_EXECUTABLE_PATH:'/opt/specific/chrome'},platform:'linux',exists:async file=>file==='/opt/specific/chrome',cached:never}),'/opt/specific/chrome');
   await assert.rejects(resolveInstalledChromium({env:{PUPPETEER_EXECUTABLE_PATH:'./chrome'},platform:'linux',exists:async()=>true}),error=>error.code==='browser_executable_missing');
+});
+
+test('Unix discovery skips non-executable files but refuses an invalid explicit override', {skip:process.platform==='win32'}, async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'browser-discovery-'));
+  try {
+    const blocked=path.join(root,'google-chrome-stable');
+    const working=path.join(root,'chromium');
+    await writeFile(blocked,'not executable',{mode:0o600});
+    await writeFile(working,'#!/bin/sh\nexit 0\n',{mode:0o700});
+    await chmod(blocked,0o600);
+    const env={PATH:root};
+    assert.equal(await resolveInstalledChromium({env,platform:'linux'}),working);
+    await assert.rejects(resolveInstalledChromium({env:{...env,PUPPETEER_EXECUTABLE_PATH:blocked},platform:'linux'}),error=>error.code==='browser_executable_missing');
+    const profileBrowser=path.join(root,'.nix-profile/bin/chromium');
+    await mkdir(path.dirname(profileBrowser),{recursive:true});
+    await writeFile(profileBrowser,'#!/bin/sh\nexit 0\n',{mode:0o700});
+    const service=new BrowserService(path.join(root,'private'),'unavailable-sdk',undefined,{discoveryEnv:{PATH:'',HOME:root}});
+    assert.equal(await service.resolveExecutable(),profileBrowser);
+  } finally { await rm(root,{recursive:true,force:true}); }
 });
 
 test('the native channel correlates answers, keeps error codes and fails pending calls on close',async()=>{

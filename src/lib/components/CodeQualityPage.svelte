@@ -6,7 +6,7 @@
   import { projectFolders, repoKey } from "../repo-agents";
   import { folderOptions as historyOptions } from "../project-history";
   import { codeQualityClient } from "../code-quality-client";
-  import { isActiveScan, modeLabel, pageScreen, parseQualityPreferences, qualityLocked, QualityGeneration, QualityViewEntry, runtimeLabel, scanAction, setupAction, STARTING_TEXT, type QualityProject, type QualityProjectDetection, type QualityScan, type QualityScanPreparation } from "../code-quality";
+  import { credentialCheckPending, isActiveScan, modeLabel, pageScreen, parseQualityPreferences, qualityLocked, QualityGeneration, QualityViewEntry, runtimeLabel, scanAction, setupAction, STARTING_TEXT, type QualityProject, type QualityProjectDetection, type QualityScan, type QualityScanPreparation } from "../code-quality";
   import CodeQualitySettings from "./CodeQualitySettings.svelte";
   import CodeQualityReport from "./CodeQualityReport.svelte";
   import CodeQualityOwnership from "./CodeQualityOwnership.svelte";
@@ -48,7 +48,7 @@
   const entryNeeded = $derived(quality?.config.mode !== "alternate" && project?.scanner === "dotnet" && !project.entryFile && (detection?.entryFiles.length ?? 0) > 1);
   const prepareWanted = $derived(!!draftProject && !!quality && !loading && !selectionNeeded && !entryNeeded);
   const projectReady = $derived(!!detection && !!draftProject && !!preparation && !loading && !selectionNeeded && !entryNeeded);
-  const credentialMissing = $derived(quality?.config.mode === "sonarqubeCommunity" ? !quality.credentials.community : quality?.config.mode === "sonarqubeEnterprise" ? !quality.credentials.enterprise : false);
+  const credentialMissing = $derived(!!quality?.credentials.checked && !quality.credentials.error && (quality.config.mode === "sonarqubeCommunity" ? !quality.credentials.community : quality.config.mode === "sonarqubeEnterprise" ? !quality.credentials.enterprise : false));
   const runtimeReady = $derived(quality?.prerequisites.some(item => item.runtime.kind === quality.config.runtime.kind && item.ready) ?? false);
   const activeId = $derived(quality?.activeScanId ?? (isActiveScan(scan) ? scan?.id ?? null : null));
   const action = $derived(scanAction({ quality, preparationReady: !!preparation && !loading, selectionNeeded, entryNeeded: !!entryNeeded, requiresConsent: !!preparation?.requiresConsent, activeScanId: activeId, locked: !activeId && locked }));
@@ -152,14 +152,14 @@
     error = ""; startingScan = true; recipeApproval = false;
     try {
       await service.mutate(current => install ? api.setupCodeQuality(current.revision, setupConsent) : api.startCodeQualityService(current.revision));
-      // Start may return while its worker is still bootstrapping the server/token.
-      while (service.snapshot.state?.busy) {
+      // Start and credential presence have separate tracked workers.
+      while (service.snapshot.state?.busy || (service.snapshot.state?.config.mode !== "alternate" && credentialCheckPending(service.snapshot.state))) {
         await new Promise(resolve => window.setTimeout(resolve, 500));
         if (!folderGeneration.accepts(folderToken, folder)) return;
         await service.refresh();
       }
       const current = service.snapshot.state;
-      if (!current || current.ownership.status !== "owned" || current.effectiveMode !== current.config.mode || current.error || current.suspended) return;
+      if (!current || current.ownership.status !== "owned" || current.effectiveMode !== current.config.mode || current.error || current.suspended || (current.config.mode !== "alternate" && (!current.credentials.checked || current.credentials.error || !(current.config.mode === "sonarqubeCommunity" ? current.credentials.community : current.credentials.enterprise)))) return;
       const fresh = await api.prepareCodeQualityScan(candidate);
       if (!folderGeneration.accepts(folderToken, folder)) return;
       preparation = fresh;
@@ -262,6 +262,10 @@
         {#if activeId}<span class="dim">Cancel scan first.</span>{/if}
       {/if}
     </div>
+    {#if quality?.ownership.status === "owned"}
+      {#if credentialCheckPending(quality)}<p role="status">Checking credentials…</p>
+      {:else if quality.credentials.error}<p class="err" role="alert">{quality.credentials.error}. Unlock the operating system credential store, then use Recheck in Advanced settings.</p>{/if}
+    {/if}
     {#if screen === "loading"}
       <section class="panel quality-section" aria-label="Loading"><p role="status">Reading code quality state…</p></section>
     {:else if screen === "ownership"}
@@ -292,12 +296,17 @@
         <p role="status">{STARTING_TEXT[quality.phase] ?? "Working…"}</p>
         {#if quality.diagnostics.length}<pre class="quality-log quality-wide" aria-live="polite">{quality.diagnostics.slice(-6).join("\n")}</pre>{/if}
       </section>
+    {:else if screen === "credentials"}
+      <section class="panel quality-section" aria-label="Checking credentials">
+        {#if quality?.error}<p class="err" role="alert">{quality.error}</p>{/if}
+        {@render folderPicker()}
+      </section>
     {:else if screen === "failed" && quality}
       <section class="panel quality-section quality-center" aria-label="Code quality failed">
         <h3>Code quality could not start</h3>
         <p class="err quality-wide" role="alert">{quality.error ?? "The analyzer did not start."}</p>
-        <button class="primary" disabled={locked} onclick={enterAgain}>Try again</button>
-        <p class="dim">Open Advanced settings above for manual setup.</p>
+        <button class="primary" disabled={locked || quality.fatal} onclick={enterAgain}>Try again</button>
+        <p class="dim">{quality.fatal ? "Resolve the state error above and reopen OMP Manager." : "Open Advanced settings above for manual setup."}</p>
       </section>
     {:else if screen === "scan" && quality}
       <section class="panel quality-section" aria-label="Scan project">

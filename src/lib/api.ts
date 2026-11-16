@@ -1,4 +1,5 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { createTerminalQueue } from "./terminal";
 import type { Classification, DependencyGraph, DerivedStandard, KnownStandard } from "./dependency-graph";
 import type { DependencyJobAdmission, GithubMode, HandoffPrepared, InhouseAdmission, InhouseStatus, PackageInsights, PackageInsightsStatus, ProjectReviewState, SecurityReviewState, UpdatePlanHandoff, UpdatePlanState, UsageExplanationState } from "./package-insights";
 import type { KindAdmission, ProjectKindStatus } from "./project-filter";
@@ -344,6 +345,8 @@ export interface HostExplainResult {
   error: { code: string; message: string } | null; blockedBy: { jobId: string; attemptId: string } | null;
 }
 
+const queueTerminal = createTerminalQueue();
+
 export const api = {
   getCodeQualityState: () => invoke<QualityState>("get_code_quality_state"),
   takeOverCodeQuality: (consent: boolean) => invoke<QualityState>("take_over_code_quality", { consent }),
@@ -441,16 +444,16 @@ export const api = {
   giveRepoToArchitect: (sourceId: string) => invoke<WorkspaceChange>("give_repo_to_architect", { sourceId }),
   listWorkspaceChanges: () => invoke<WorkspaceChange[]>("list_workspace_changes"),
   listComputedWorkspaceFolders: () => invoke<string[]>("list_computed_workspace_folders"),
-  startInstance: (id: string, fresh: boolean) => invoke<void>("start_instance", { id, fresh }),
-  stopInstance: (id: string) => invoke<void>("stop_instance", { id }),
-  restartInstance: (id: string) => invoke<void>("restart_instance", { id }),
+  startInstance: (id: string, fresh: boolean) => queueTerminal(`pty:${id}`, () => invoke<void>("start_instance", { id, fresh })),
+  stopInstance: (id: string) => queueTerminal(`pty:${id}`, () => invoke<void>("stop_instance", { id })),
+  restartInstance: (id: string) => queueTerminal(`pty:${id}`, () => invoke<void>("restart_instance", { id })),
   openNativeAgentHub: (id: string, expectedGeneration: number) => invoke<void>("open_native_agent_hub", { id, expectedGeneration }),
   listHumanDecisions: () => invoke<HumanDecisionSnapshot>("list_human_decisions"),
   respondHumanDecision: (target: HumanDecisionTarget, response: HumanDecisionResponse) => invoke<{ accepted: true }>("respond_human_decision", { target, response }),
-  removeInstance: (id: string) => invoke<void>("remove_instance", { id }),
-  attachPty: (id: string, onData: Channel<PtyChunk>) => invoke<void>("attach_pty", { id, onData }),
-  writePty: (id: string, data: string) => invoke<void>("write_pty", { id, data }),
-  resizePty: (id: string, cols: number, rows: number) => invoke<void>("resize_pty", { id, cols, rows }),
+  removeInstance: (id: string) => queueTerminal(`pty:${id}`, () => invoke<void>("remove_instance", { id })),
+  attachPty: (id: string, onData: Channel<PtyChunk>) => queueTerminal(`pty:${id}`, () => invoke<void>("attach_pty", { id, onData })),
+  writePty: (id: string, data: string) => queueTerminal(`pty:${id}`, () => invoke<void>("write_pty", { id, data })),
+  resizePty: (id: string, cols: number, rows: number) => queueTerminal(`pty:${id}`, () => invoke<void>("resize_pty", { id, cols, rows })),
   listSessions: (projectPath: string, profile: string) => invoke<SessionInfo[]>("list_sessions", { projectPath, profile }),
   readPlan: (id: string) => invoke<string | null>("read_plan", { id }),
   listPlanBackups: (id: string) => invoke<PlanBackup[]>("list_plan_backups", { id }),
@@ -464,7 +467,7 @@ export const api = {
   exportConfig: (path: string, destination: string) => invoke<void>("export_config", { path, destination }),
   listConfigModels: (sourceId: string | null) => invoke<ConfigModels>("list_config_models", { sourceId }),
   saveModelConfigAssignments: (assignments: ModelConfigAssignment[]) => invoke<void>("save_model_config_assignments", { assignments }),
-  switchSessionConfig: (id: string, path: string | null) => invoke<void>("switch_session_config", { id, path }),
+  switchSessionConfig: (id: string, path: string | null) => queueTerminal(`pty:${id}`, () => invoke<void>("switch_session_config", { id, path })),
   listAgentFiles: (kind: Instance["kind"]) => invoke<AgentFiles>("list_agent_files", { kind }),
   listOmpProfiles: () => invoke<OmpProfiles>("list_omp_profiles"),
   getSetupPaths: () => invoke<SetupPaths>("get_setup_paths"),
@@ -480,10 +483,10 @@ export const api = {
   attachCommandOutput: (id: string, generation: number, sessionId: string, executionId: string, onData: Channel<CommandOutput>) => invoke<void>("attach_command_output", { id, generation, sessionId, executionId, onData }),
   killTerminalCommand: (id: string, generation: number, sessionId: string, executionId: string) => invoke<void>("kill_terminal_command", { id, generation, sessionId, executionId }),
   openUserTerminal: (id: string) => invoke<UserShellInfo>("open_user_terminal", { id }),
-  attachUserTerminal: (id: string, shellId: string, onData: Channel<PtyChunk>) => invoke<void>("attach_user_terminal", { id, shellId, onData }),
-  writeUserTerminal: (id: string, shellId: string, data: string) => invoke<void>("write_user_terminal", { id, shellId, data }),
-  resizeUserTerminal: (id: string, shellId: string, cols: number, rows: number) => invoke<void>("resize_user_terminal", { id, shellId, cols, rows }),
-  closeUserTerminal: (id: string, shellId: string) => invoke<void>("close_user_terminal", { id, shellId }),
+  attachUserTerminal: (id: string, shellId: string, onData: Channel<PtyChunk>) => queueTerminal(`shell:${id}:${shellId}`, () => invoke<void>("attach_user_terminal", { id, shellId, onData })),
+  writeUserTerminal: (id: string, shellId: string, data: string) => queueTerminal(`shell:${id}:${shellId}`, () => invoke<void>("write_user_terminal", { id, shellId, data })),
+  resizeUserTerminal: (id: string, shellId: string, cols: number, rows: number) => queueTerminal(`shell:${id}:${shellId}`, () => invoke<void>("resize_user_terminal", { id, shellId, cols, rows })),
+  closeUserTerminal: (id: string, shellId: string) => queueTerminal(`shell:${id}:${shellId}`, () => invoke<void>("close_user_terminal", { id, shellId })),
   openHostMonitor: (instanceId: string, expectedGeneration: number) => invoke<HostMonitorOpen>("open_host_monitor", { instanceId, expectedGeneration }),
   collectHostMonitor: (viewId: string, displayedSnapshotId: string | null) => invoke<HostSnapshotSummary>("collect_host_monitor", { viewId, displayedSnapshotId }),
   readHostMonitor: (snapshotId: string, query: HostMonitorQuery) => invoke<HostMonitorPage>("read_host_monitor", { snapshotId, query }),

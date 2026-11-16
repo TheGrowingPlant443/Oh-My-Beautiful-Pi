@@ -15,12 +15,19 @@ use super::{alternate, install, process_lock, secrets, sonar, store};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const MAX_DIAGNOSTICS: usize = 200;
+
+#[derive(PartialEq, Eq)]
+struct CredentialTargets {
+    config: QualityConfig,
+    community: Option<String>,
+    enterprise: Option<String>,
+}
 
 /// A scan currently owning the gate; `scan` is the live copy served to pollers.
 pub(crate) struct ActiveScan {
@@ -66,6 +73,7 @@ pub struct CodeQualityService {
     /// Read-only prerequisite probe; a seam so tests never touch the real machine.
     pub(crate) probe: ProbeFn,
     pub(crate) closing: AtomicBool,
+    pub(crate) credential_refresh_generation: AtomicU64,
     pub(crate) workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -134,7 +142,7 @@ fn platform_name() -> &'static str {
 /// What "Install and setup" still has to do, derived only from cached probes and state (never probes).
 /// On Linux/macOS nothing is ever installed: the runtime step only asks whether the engine is usable.
 #[must_use]
-fn setup_state(inner: &Inner, credential_store_ok: bool) -> SetupState {
+fn setup_state(inner: &Inner) -> SetupState {
     let config = &inner.file.config;
     let probed = !inner.prerequisites.is_empty();
     let prerequisite = inner
@@ -189,12 +197,14 @@ fn setup_state(inner: &Inner, credential_store_ok: bool) -> SetupState {
             prerequisite.is_some_and(|p| p.ready),
             false,
         );
-        push(
-            "credentials",
-            "Credential store (Secret Service / Keychain) is usable".into(),
-            credential_store_ok,
-            false,
-        );
+        if config.mode != QualityMode::Alternate {
+            push(
+                "credentials",
+                "Credential store (Secret Service / Keychain) is usable".into(),
+                inner.credentials.checked && inner.credentials.error.is_none(),
+                inner.credentials.error.is_some(),
+            );
+        }
     }
     if let (true, QualityRuntime::Podman { connection }) = (windows, &config.runtime) {
         push(
@@ -215,12 +225,20 @@ fn setup_state(inner: &Inner, credential_store_ok: bool) -> SetupState {
     if config.mode == QualityMode::SonarqubeCommunity {
         push(
             "token",
-            "Create the scan token".into(),
-            inner.credentials.community,
-            false,
+            if inner.credentials.checked && inner.credentials.error.is_none() {
+                "Create the scan token"
+            } else {
+                "Check the scan token"
+            }.into(),
+            inner.credentials.checked && inner.credentials.error.is_none() && inner.credentials.community,
+            inner.credentials.error.is_some(),
         );
     }
-    let needed = steps.iter().any(|s| s.state != SetupStepState::Done);
+    // Presence checks have their own pending UI; an unchecked token is not a setup failure.
+    let needed = steps.iter().any(|step| {
+        step.state != SetupStepState::Done
+            && (inner.credentials.checked || !matches!(step.id.as_str(), "credentials" | "token"))
+    });
     let install_required = windows
         && steps.iter().any(|s| {
             matches!(s.id.as_str(), "windowsFeatures" | "runtime" | "machine")
@@ -350,10 +368,10 @@ impl CodeQualityService {
             ownership: Mutex::new(Ownership::new(held)),
             probe,
             closing: AtomicBool::new(false),
+            credential_refresh_generation: AtomicU64::new(0),
             workers: Mutex::new(Vec::new()),
         });
         svc.refresh_rules();
-        svc.refresh_credentials();
         if svc.owns_resources() && svc.inner.lock().fatal.is_none() {
             svc.recover_interrupted_jobs();
             if let Err(error) = svc.publish_owner() {
@@ -410,15 +428,16 @@ impl CodeQualityService {
             operation_id: inner.operation_id.clone(),
             requested_config: inner.requested.clone(),
             error: inner.error.clone(),
+            fatal: inner.fatal.is_some(),
             community: inner.community.clone(),
-            credentials: inner.credentials,
+            credentials: inner.credentials.clone(),
             rules: inner.rules.clone(),
             prerequisites: inner.prerequisites.clone(),
             options: inner.options.clone(),
             active_scan_id: inner.active_scan.as_ref().map(|s| s.id.clone()),
             diagnostics: inner.diagnostics.iter().cloned().collect(),
             unresolved: inner.unresolved.clone(),
-            setup: setup_state(&inner, credential_store.available),
+            setup: setup_state(&inner),
             start_at_launch: inner.file.start_at_launch,
             platform: platform_name().to_string(),
             credential_store,
@@ -512,13 +531,16 @@ impl CodeQualityService {
     /// Stable per-resource-set identity: installation + runtime + daemon fingerprint. `None` until a
     /// daemon fingerprint has been recorded for that runtime.
     pub(crate) fn resource_set_id(&self, runtime: &QualityRuntime) -> Option<String> {
+        self.resource_set_id_for(runtime, &self.inner.lock().installation)
+    }
+
+    fn resource_set_id_for(&self, runtime: &QualityRuntime, installation: &str) -> Option<String> {
         let resources = store::load_resources(&self.paths).ok()?;
         let record = resources.runtime(runtime)?;
-        let inner = self.inner.lock();
         Some(
             secrets::sha256_hex(&format!(
                 "{}|{}|{}",
-                inner.installation,
+                installation,
                 runtime.key(),
                 record.fingerprint
             ))[..16]
@@ -549,22 +571,99 @@ impl CodeQualityService {
         )
     }
 
-    pub(crate) fn refresh_credentials(&self) {
-        let config = self.inner.lock().file.config.clone();
+    fn credential_targets(&self, inner: &Inner) -> CredentialTargets {
+        let config = &inner.file.config;
         let community = self
-            .community_token_target(&config.runtime)
-            .map(|t| matches!(self.secrets.read(&t), Ok(Some(_))))
-            .unwrap_or(false);
-        let enterprise = !config.enterprise_url.is_empty()
-            && matches!(
-                self.secrets
-                    .read(&self.enterprise_token_target(&config.enterprise_url)),
-                Ok(Some(_))
-            );
-        self.inner.lock().credentials = CredentialPresence {
-            community,
-            enterprise,
+            .resource_set_id_for(&config.runtime, &inner.installation)
+            .map(|set| secrets::target_name(&self.config_root, &format!("community:{set}"), "token"));
+        let enterprise = (!config.enterprise_url.is_empty())
+            .then(|| self.enterprise_token_target(&config.enterprise_url));
+        CredentialTargets { config: config.clone(), community, enterprise }
+    }
+
+    /// Call while holding `inner` whenever the committed configuration or resource identity changes.
+    pub(crate) fn invalidate_credentials(&self, inner: &mut Inner) {
+        self.credential_refresh_generation.fetch_add(1, Ordering::AcqRel);
+        inner.credentials = CredentialPresence::default();
+    }
+
+    /// Presence is presentation only. Actual credential use always reads the OS store afresh.
+    /// Snapshot targets before spawning; never hold ownership/state locks across an OS-store call.
+    pub fn schedule_credential_refresh(self: &Arc<Self>) -> Result<()> {
+        let (generation, owner, targets) = {
+            let ownership = self.ownership.lock();
+            if ownership.lock.is_none() || ownership.handed_off || ownership.transferring {
+                return Ok(());
+            }
+            if self.closing.load(Ordering::Acquire) {
+                return Err("OMP Manager is closing.".into());
+            }
+            let mut inner = self.inner.lock();
+            if inner.fatal.is_some() {
+                return Ok(());
+            }
+            let targets = self.credential_targets(&inner);
+            self.invalidate_credentials(&mut inner);
+            (
+                self.credential_refresh_generation.load(Ordering::Acquire),
+                ownership.instance_id.clone(),
+                targets,
+            )
         };
+        let svc = self.clone();
+        let spawned = self.spawn_worker("code-quality-credentials", move || {
+            if svc.closing.load(Ordering::Acquire)
+                || svc.credential_refresh_generation.load(Ordering::Acquire) != generation
+            {
+                return;
+            }
+            let presence: Result<CredentialPresence> = (|| {
+                svc.secrets.verify()?;
+                let read = |target: &Option<String>| -> Result<bool> {
+                    if svc.closing.load(Ordering::Acquire)
+                        || svc.credential_refresh_generation.load(Ordering::Acquire) != generation
+                    {
+                        return Err("Credential refresh superseded.".into());
+                    }
+                    target.as_deref().map(|target| svc.secrets.read(target).map(|value| value.is_some()))
+                        .unwrap_or(Ok(false))
+                };
+                Ok(CredentialPresence {
+                    checked: true,
+                    error: None,
+                    community: read(&targets.community)?,
+                    enterprise: read(&targets.enterprise)?,
+                })
+            })();
+            let ownership = svc.ownership.lock();
+            let mut inner = svc.inner.lock();
+            if !svc.closing.load(Ordering::Acquire)
+                && ownership.lock.is_some()
+                && !ownership.handed_off
+                && ownership.instance_id == owner
+                && svc.credential_refresh_generation.load(Ordering::Acquire) == generation
+                && svc.credential_targets(&inner) == targets
+            {
+                inner.credentials = presence.unwrap_or_else(|_| CredentialPresence {
+                    checked: true,
+                    error: Some("Credential store unavailable".into()),
+                    ..CredentialPresence::default()
+                });
+            }
+        });
+        if spawned.is_err() {
+            let mut inner = self.inner.lock();
+            if !self.closing.load(Ordering::Acquire)
+                && self.credential_refresh_generation.load(Ordering::Acquire) == generation
+            {
+                inner.credentials = CredentialPresence {
+                    checked: true,
+                    error: Some("Credential store unavailable".into()),
+                    ..CredentialPresence::default()
+                };
+            }
+        }
+        spawned
     }
 
     #[must_use]
@@ -588,28 +687,48 @@ impl CodeQualityService {
         name: &str,
         work: impl FnOnce() + Send + 'static,
     ) -> Result<()> {
+        // Shutdown takes this same lock before closing admission and draining the handles.
+        let mut workers = self.workers.lock();
+        if self.closing.load(Ordering::Acquire) {
+            return Err("OMP Manager is closing.".into());
+        }
+        let mut index = 0;
+        while index < workers.len() {
+            if workers[index].is_finished() {
+                let _ = workers.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
         let handle = thread::Builder::new()
             .name(name.to_string())
             .spawn(work)
             .map_err(|e| e.to_string())?;
-        let mut workers = self.workers.lock();
-        workers.retain(|h| !h.is_finished());
         workers.push(handle);
         Ok(())
     }
 
     /// Keep OS authority until every admitted operation and worker has actually stopped.
     pub fn shutdown(self: &Arc<Self>) {
-        if self.closing.swap(true, Ordering::AcqRel) {
+        let mut workers = self.workers.lock();
+        let already_closing = {
+            // Credential publication holds `inner`; closing and publication have one ordering.
+            let _inner = self.inner.lock();
+            self.closing.swap(true, Ordering::AcqRel)
+        };
+        if already_closing {
+            drop(workers);
             // Concurrent close requests must not release the mutex underneath the first cleanup.
             while self.owns_resources() {
                 thread::sleep(Duration::from_millis(50));
             }
             return;
         }
+        let handles = std::mem::take(&mut *workers);
+        // Release admission before joining workers that might attempt to schedule work.
+        drop(workers);
         self.request_cancel_all();
-        let workers = std::mem::take(&mut *self.workers.lock());
-        for handle in workers {
+        for handle in handles {
             let _ = handle.join();
         }
         while self.ownership.lock().transferring {

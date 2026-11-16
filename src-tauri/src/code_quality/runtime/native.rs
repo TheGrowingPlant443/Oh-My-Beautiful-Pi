@@ -1,15 +1,18 @@
 //! Linux and macOS container runtimes. There is no WSL and no app-provisioned VM here:
 //!
 //! * Linux: native (rootless) Podman, which is daemonless, and native Docker Engine.
-//! * macOS: Podman through the user's own `podman machine` and Docker Desktop. (Written from the
-//!   documented CLIs; this repository's CI cannot run macOS, so the macOS-only code is unverified.)
+//! * macOS: Podman through the user's own `podman machine` and Docker Desktop. A Podman selection is
+//!   bound to its machine by the connection's live SSH endpoint and identity, never by name.
 //!
 //! The app never installs a container engine and never creates a Podman machine. It detects, probes
 //! and explains. A missing or stopped engine is an actionable `Err`, never a silent fallback to
 //! another runtime.
 use super::cli_engine::{self, CliEngine, Engine, EngineProbe, RunControl, PROBE_TIMEOUT};
+#[cfg(any(target_os = "macos", test))]
+use crate::code_quality::install::{self, MachineBinding, PodmanTarget};
 use crate::code_quality::types::{Prerequisite, QualityOptions, QualityRuntime, Result};
 use serde_json::Value;
+#[cfg(any(not(target_os = "macos"), test))]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,11 +27,13 @@ fn standard_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         dirs.push(home.join(".nix-profile/bin"));
+        dirs.push(home.join(".local/state/nix/profile/bin"));
         dirs.push(home.join(".local/bin"));
     }
     dirs.extend(
         [
             "/run/current-system/sw/bin",
+            "/nix/var/nix/profiles/default/bin",
             "/usr/bin",
             "/usr/local/bin",
             "/opt/homebrew/bin",
@@ -53,7 +58,19 @@ pub(super) fn podman_program() -> Option<PathBuf> {
     program("podman")
 }
 pub(super) fn docker_program() -> Option<PathBuf> {
-    program("docker")
+    let mut candidates: Vec<PathBuf> = standard_dirs()
+        .into_iter()
+        .map(|dir| dir.join("docker"))
+        .collect();
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            candidates.push(home.join(".docker/bin/docker"));
+            candidates.push(home.join("Applications/Docker.app/Contents/Resources/bin/docker"));
+        }
+        candidates.push("/Applications/Docker.app/Contents/Resources/bin/docker".into());
+    }
+    cli_engine::discover_program("docker", &candidates)
 }
 
 #[must_use]
@@ -64,7 +81,7 @@ pub(crate) fn macos() -> bool {
 #[must_use]
 pub(crate) fn missing_podman() -> String {
     if macos() {
-        "Podman is not installed. Install it with Homebrew (`brew install podman`), then create and start a machine yourself (`podman machine init`, `podman machine start`) and Recheck. OMP Manager never installs software or creates machines on macOS.".into()
+        "Podman is not installed. Install the Podman CLI with Nix (`nix --extra-experimental-features 'nix-command flakes' profile add nixpkgs#podman`), then create and start a Podman machine yourself (for example `podman machine init --now`) and Recheck. A machine is required on macOS; OMP Manager never installs software or creates machines on macOS.".into()
     } else {
         "Podman is not installed. Install it (Nix: `nix profile add nixpkgs#podman`; Debian/Ubuntu: `apt install podman`; Fedora: `dnf install podman`; Arch: `pacman -S podman`) and make sure rootless containers work (`podman info`), then Recheck. OMP Manager never installs container engines.".into()
     }
@@ -173,6 +190,7 @@ pub(super) fn parse_docker_info(v: &Value) -> Result<Info> {
 }
 
 /// Reads the two kernel settings SonarQube's search engine checks. Absent/unreadable → `None`.
+#[cfg(any(not(target_os = "macos"), test))]
 #[must_use]
 pub(super) fn read_limits_at(proc_sys: &Path) -> (Option<u64>, Option<u64>) {
     let read = |name: &str| {
@@ -188,50 +206,80 @@ pub(crate) fn limits_low(max_map_count: Option<u64>, file_max: Option<u64>) -> b
     max_map_count.is_some_and(|v| v < MIN_MAP_COUNT) || file_max.is_some_and(|v| v < MIN_FILE_MAX)
 }
 
-/// The Podman machine a macOS client talks to: the explicit connection's machine, else the default one.
-/// The app never creates or starts a machine; a stopped/missing one is reported.
-#[cfg(target_os = "macos")]
-fn running_machine(engine: &CliEngine, control: &RunControl) -> Result<String> {
-    let out = engine.success(
-        &["machine", "list", "--format", "json"],
-        PROBE_TIMEOUT,
-        control,
-        "List Podman machines",
-    )?;
-    let machines: Vec<Value> = serde_json::from_slice(&out.stdout)
-        .map_err(|_| "Invalid Podman machine list.".to_string())?;
-    let wanted = match &engine.runtime {
-        QualityRuntime::Podman { connection } if !connection.is_empty() => {
-            Some(connection.as_str())
-        }
-        _ => None,
-    };
-    let running: Vec<&Value> = machines
-        .iter()
-        .filter(|m| m["Running"].as_bool() == Some(true))
-        .collect();
-    let chosen = running
-        .iter()
-        .find(|m| {
-            wanted.is_some_and(|w| m["Name"].as_str().map(|n| n.trim_end_matches('*')) == Some(w))
-        })
-        .or_else(|| {
-            running
-                .iter()
-                .find(|m| m["Default"].as_bool() == Some(true))
-        })
-        .or_else(|| {
-            if running.len() == 1 {
-                running.first()
-            } else {
-                None
-            }
-        });
-    match chosen.and_then(|m| m["Name"].as_str()) {
-        Some(name) => Ok(name.trim_end_matches('*').to_owned()),
-        None if machines.is_empty() => Err("No Podman machine exists. Create and start one yourself (`podman machine init` then `podman machine start`), then Recheck. OMP Manager does not create machines on macOS.".into()),
-        None => Err("No Podman machine is running. Start yours (`podman machine start`) and Recheck. OMP Manager does not start machines on macOS.".into()),
+/// The verified machine behind a macOS Podman selection (empty: the default connection).
+/// `Ok(None)`: an explicitly selected connection that addresses no local machine, which may serve
+/// ordinary engine operations while its VM limits stay unknown and are never changed.
+/// The app never creates or starts a machine; a stopped or missing one is reported.
+#[cfg(any(target_os = "macos", test))]
+fn podman_machine(
+    program: &Path,
+    connection: &str,
+    control: &RunControl,
+) -> Result<Option<MachineBinding>> {
+    match install::podman_target(program, connection, control)? {
+        PodmanTarget::Machine(machine) if machine.running => Ok(Some(machine)),
+        PodmanTarget::Machine(machine) => Err(format!("The Podman machine '{0}' behind this connection is not running. Start it yourself (`podman machine start {0}`) and Recheck. OMP Manager does not start machines on macOS.", machine.name)),
+        PodmanTarget::Remote => Ok(None),
     }
+}
+
+/// Reads the SonarQube kernel settings inside one verified machine. Unreadable → unknown.
+#[cfg(any(target_os = "macos", test))]
+fn machine_limits(
+    program: &Path,
+    machine: &str,
+    control: &RunControl,
+) -> (Option<u64>, Option<u64>) {
+    let mut cmd = Command::new(program);
+    cmd.args([
+        "machine",
+        "ssh",
+        machine,
+        "cat",
+        "/proc/sys/vm/max_map_count",
+        "/proc/sys/fs/file-max",
+    ]);
+    match cli_engine::run_bounded(cmd, None, PROBE_TIMEOUT, control) {
+        Ok(out) if out.status.success() => {
+            let numbers: Vec<u64> = out
+                .text()
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            (numbers.first().copied(), numbers.get(1).copied())
+        }
+        _ => (None, None),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+const REMOTE_LIMITS: &str = "Cannot raise limits on a Podman connection that is not proven to address a local Podman machine. Ask its administrator to set vm.max_map_count>=524288 and fs.file-max>=131072, then Recheck.";
+
+/// Consented raise inside the one machine bound to `connection`; the result is read back only
+/// while the same binding (name and creation identity) still holds.
+#[cfg(any(target_os = "macos", test))]
+fn raise_in_machine(
+    program: &Path,
+    connection: &str,
+    script: &Path,
+    control: &RunControl,
+) -> Result<()> {
+    let machine = podman_machine(program, connection, control)?.ok_or(REMOTE_LIMITS)?;
+    let mut cmd = Command::new(program);
+    cmd.args([
+        "machine",
+        "ssh",
+        &machine.name,
+        "sudo",
+        "-n",
+        "/bin/sh",
+        "-s",
+    ]);
+    let read = || match podman_machine(program, connection, control) {
+        Ok(Some(current)) if current == machine => machine_limits(program, &machine.name, control),
+        _ => (None, None),
+    };
+    raise_with(cmd, script, &read, control)
 }
 
 pub(super) fn probe(engine: &CliEngine, control: &RunControl) -> Result<EngineProbe> {
@@ -305,24 +353,27 @@ pub(super) fn probe(engine: &CliEngine, control: &RunControl) -> Result<EnginePr
         }
         _ => {}
     }
+    // One verified machine association supplies both the creation identity and the limit reads.
     #[cfg(target_os = "macos")]
-    let machine = if podman {
-        Some(running_machine(engine, control)?)
-    } else {
-        None
+    let (identity, (max_map_count, file_max)) = match &engine.runtime {
+        QualityRuntime::Podman { connection } => {
+            match podman_machine(&engine.program, connection, control)? {
+                Some(machine) => {
+                    let limits = machine_limits(&engine.program, &machine.name, control);
+                    (machine.created, limits)
+                }
+                None => (String::new(), (None, None)),
+            }
+        }
+        _ => (String::new(), (None, None)),
     };
     #[cfg(not(target_os = "macos"))]
-    let machine: Option<String> = None;
-    let identity = machine
-        .as_deref()
-        .and_then(|m| machine_created(engine, m, control))
-        .unwrap_or_default();
+    let (identity, (max_map_count, file_max)) = (String::new(), host_limits(&engine.runtime));
     let fingerprint = if podman {
         format!("podman:{}:{}:{identity}", info.id, info.graph)
     } else {
         format!("docker:{}", info.id)
     };
-    let (max_map_count, file_max) = limits(engine, machine.as_deref(), control);
     Ok(EngineProbe {
         fingerprint,
         os: info.os,
@@ -341,66 +392,16 @@ fn explain_probe_failure(runtime: &QualityRuntime, error: String) -> String {
         QualityRuntime::DockerNative if lower.contains("cannot connect") || lower.contains("is the docker daemon running") =>
             format!("{error}\nThe Docker service is not running. Start it (for example `sudo systemctl start docker`); OMP Manager never starts system services."),
         QualityRuntime::Podman { .. } if macos() && (lower.contains("connection") || lower.contains("podman machine")) =>
-            format!("{error}\nStart your Podman machine (`podman machine start`); OMP Manager does not start machines on macOS."),
+            format!("{error}\nStart the Podman machine behind this connection yourself (`podman machine start <name>`), or create one first (`podman machine init --now`); OMP Manager does not create or start machines on macOS."),
         _ => error,
     }
 }
 
-#[cfg(target_os = "macos")]
-fn machine_created(engine: &CliEngine, machine: &str, control: &RunControl) -> Option<String> {
-    let out = engine
-        .success(
-            &["machine", "inspect", machine],
-            PROBE_TIMEOUT,
-            control,
-            "Inspect Podman machine",
-        )
-        .ok()?;
-    let value: Value = serde_json::from_slice(&out.stdout).ok()?;
-    value.as_array()?.first()?["Created"]
-        .as_str()
-        .map(str::to_owned)
-}
-#[cfg(not(target_os = "macos"))]
-fn machine_created(_: &CliEngine, _: &str, _: &RunControl) -> Option<String> {
-    None
-}
-
 /// Linux reads its own kernel settings (the engine shares them); a remote Podman connection cannot be
-/// inspected from here. macOS reads them from inside the machine VM, which manages them itself.
-fn limits(
-    engine: &CliEngine,
-    machine: Option<&str>,
-    control: &RunControl,
-) -> (Option<u64>, Option<u64>) {
-    #[cfg(target_os = "macos")]
-    if let Some(machine) = machine {
-        let mut cmd = Command::new(&engine.program);
-        cmd.args([
-            "machine",
-            "ssh",
-            machine,
-            "cat",
-            "/proc/sys/vm/max_map_count",
-            "/proc/sys/fs/file-max",
-        ]);
-        return match cli_engine::run_bounded(cmd, None, PROBE_TIMEOUT, control) {
-            Ok(out) if out.status.success() => {
-                let numbers: Vec<u64> = out
-                    .text()
-                    .split_whitespace()
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
-                (numbers.first().copied(), numbers.get(1).copied())
-            }
-            _ => (None, None),
-        };
-    }
-    let _ = (machine, control);
-    if macos() {
-        return (None, None);
-    }
-    match &engine.runtime {
+/// inspected from here. (macOS reads them inside the verified machine VM instead.)
+#[cfg(not(target_os = "macos"))]
+fn host_limits(runtime: &QualityRuntime) -> (Option<u64>, Option<u64>) {
+    match runtime {
         QualityRuntime::Podman { connection } if !connection.is_empty() => (None, None),
         _ => read_limits_at(Path::new("/proc/sys")),
     }
@@ -419,7 +420,7 @@ pub(super) fn ensure_started(engine: &CliEngine, control: &RunControl) -> Result
                 .require_success("Start Docker Desktop")?;
         }
         QualityRuntime::Podman { .. } if macos() => {
-            return Err(format!("{first}\nNo Podman machine is running. Start yours (`podman machine start`); OMP Manager does not create or start machines on macOS."));
+            return Err(format!("{first}\nThe selected Podman machine is not reachable. Start it yourself (`podman machine start <name>`); OMP Manager does not create or start machines on macOS."));
         }
         QualityRuntime::Podman { .. } => {
             return Err(format!("{first}\nPodman needs no daemon, so there is nothing to start: fix the problem above (`podman info` must work for your user)."));
@@ -484,26 +485,15 @@ pub(crate) fn probe_prerequisites(
         podman_connections: connections,
         ..QualityOptions::default()
     };
-    let podman = match selected {
-        QualityRuntime::Podman { connection } => QualityRuntime::Podman {
-            connection: connection.clone(),
-        },
-        _ => QualityRuntime::Podman {
-            connection: String::new(),
-        },
-    };
-    let docker = if macos() {
-        QualityRuntime::DockerDesktop
-    } else {
-        QualityRuntime::DockerNative
-    };
+    let podman_installed = podman_program().is_some();
     let mut result = Vec::new();
-    for runtime in [podman, docker] {
+    for runtime in prerequisite_runtimes(selected, podman_installed)
+        .into_iter()
+        .flatten()
+    {
         let installed = match &runtime {
-            QualityRuntime::Podman { .. } => podman_program().is_some(),
-            QualityRuntime::DockerDesktop => {
-                docker_program().is_some() && Path::new("/Applications/Docker.app").exists()
-            }
+            QualityRuntime::Podman { .. } => podman_installed,
+            QualityRuntime::DockerDesktop => docker_program().is_some(),
             _ => docker_program().is_some(),
         };
         let probe = CliEngine::try_new(runtime.clone(), config_root)
@@ -523,17 +513,49 @@ pub(crate) fn probe_prerequisites(
     (result, options)
 }
 
+/// Podman first: Docker is only discovered and probed when the Podman CLI is missing or Docker is the
+/// selected runtime. A stopped or broken Podman is reported as such, never a reason to probe Docker.
+fn prerequisite_runtimes(
+    selected: &QualityRuntime,
+    podman_installed: bool,
+) -> [Option<QualityRuntime>; 2] {
+    let podman = QualityRuntime::Podman {
+        connection: match selected {
+            QualityRuntime::Podman { connection } => connection.clone(),
+            _ => String::new(),
+        },
+    };
+    let docker_selected = matches!(
+        selected,
+        QualityRuntime::DockerNative | QualityRuntime::DockerDesktop
+    );
+    let docker = (!podman_installed || docker_selected).then(|| {
+        if macos() {
+            QualityRuntime::DockerDesktop
+        } else {
+            QualityRuntime::DockerNative
+        }
+    });
+    [Some(podman), docker]
+}
+
 /// Facts about a *working* engine the user should still see (never errors).
 #[must_use]
 pub(crate) fn runtime_notes(runtime: &QualityRuntime, probe: &EngineProbe) -> Option<String> {
     let mut notes = Vec::new();
     if limits_low(probe.max_map_count, probe.file_max) {
         notes.push(if macos() {
-            "The Podman machine VM's vm.max_map_count/fs.file-max are below what SonarQube needs; raise them inside the VM (`podman machine ssh`).".to_string()
+            "The Podman machine VM's vm.max_map_count/fs.file-max are below what SonarQube needs; use Prepare runtime to raise them inside that verified machine after your approval.".to_string()
         } else {
             format!("vm.max_map_count ({}) or fs.file-max ({}) is below SonarQube's minimum ({MIN_MAP_COUNT}/{MIN_FILE_MAX}); use Prepare runtime to raise it with administrator approval (polkit).",
                 probe.max_map_count.map_or("unknown".into(), |v| v.to_string()), probe.file_max.map_or("unknown".into(), |v| v.to_string()))
         });
+    } else if macos()
+        && matches!(runtime, QualityRuntime::Podman { .. })
+        && probe.max_map_count.is_none()
+        && probe.file_max.is_none()
+    {
+        notes.push("This Podman connection is not associated with a local Podman machine (or its kernel settings could not be read), so its VM limits are unknown and OMP Manager will not change them. SonarQube needs vm.max_map_count>=524288 and fs.file-max>=131072.".to_string());
     }
     if let Some(reason) = &probe.cpu_limits_unsupported {
         notes.push(format!(
@@ -552,13 +574,18 @@ pub(crate) fn pkexec_program() -> Option<PathBuf> {
 
 /// Raises `vm.max_map_count`/`fs.file-max` after explicit consent, never lowering a value. Linux: the
 /// fixed script is piped into `pkexec /bin/sh -s` (no script path is ever executed as root, so the
-/// user-writable config folder cannot be raced). macOS: inside the Podman machine VM.
+/// user-writable config folder cannot be raced). macOS: inside the one verified Podman machine VM.
 pub(crate) fn raise_vm_limits(
     engine: &dyn Engine,
     config_root: &Path,
     control: &RunControl,
 ) -> Result<()> {
     let script = super::super::install::materialize_vm_limits_script(config_root)?;
+    #[cfg(target_os = "macos")]
+    if let QualityRuntime::Podman { connection } = engine.runtime() {
+        let program = podman_program().ok_or_else(missing_podman)?;
+        return raise_in_machine(&program, connection, &script, control);
+    }
     let read = || -> (Option<u64>, Option<u64>) {
         engine
             .probe(control)
@@ -566,17 +593,9 @@ pub(crate) fn raise_vm_limits(
             .unwrap_or((None, None))
     };
     let cmd = match engine.runtime() {
-        QualityRuntime::Podman { connection } if macos() => {
-            // The machine is resolved by the engine probe on every call; here it is addressed by name.
-            let mut cmd = Command::new(podman_program().ok_or_else(missing_podman)?);
-            cmd.args(["machine", "ssh"]);
-            if !connection.is_empty() { cmd.arg(connection); }
-            cmd.args(["sudo", "-n", "/bin/sh", "-s"]);
-            cmd
-        }
         QualityRuntime::DockerDesktop if macos() => return Err("Docker Desktop does not expose a supported VM sysctl setup API to this app. Follow Docker Desktop's supported Linux VM configuration instructions to set vm.max_map_count>=524288 and fs.file-max>=131072, then Recheck.".into()),
         QualityRuntime::Podman { connection } if !connection.is_empty() => return Err("Cannot raise limits on an unverified remote Podman engine. Ask its administrator to set vm.max_map_count>=524288 and fs.file-max>=131072, then Recheck.".into()),
-        QualityRuntime::Podman { .. } | QualityRuntime::DockerNative => pkexec_command(pkexec_program())?,
+        QualityRuntime::Podman { .. } | QualityRuntime::DockerNative if !macos() => pkexec_command(pkexec_program())?,
         _ => return Err("This runtime has no Linux VM limits to raise from this platform.".into()),
     };
     raise_with(cmd, &script, &read, control)
@@ -826,8 +845,42 @@ mod tests {
     }
 
     #[test]
-    fn missing_engine_messages_name_the_nix_and_homebrew_installs_and_promise_no_install() {
-        if !macos() {
+    fn prerequisites_look_up_docker_only_without_podman_or_when_docker_is_selected() {
+        let docker = if macos() {
+            QualityRuntime::DockerDesktop
+        } else {
+            QualityRuntime::DockerNative
+        };
+        let work = QualityRuntime::Podman {
+            connection: "work-box".into(),
+        };
+        let default = QualityRuntime::Podman {
+            connection: String::new(),
+        };
+        // An installed Podman, even stopped or broken, never triggers a Docker lookup.
+        assert_eq!(prerequisite_runtimes(&work, true), [Some(work.clone()), None]);
+        // A missing Podman CLI falls back to listing Docker after the selected Podman row.
+        assert_eq!(
+            prerequisite_runtimes(&work, false),
+            [Some(work.clone()), Some(docker.clone())]
+        );
+        // An explicitly selected Docker runtime is always probed, keeping the default Podman row first.
+        for selected in [QualityRuntime::DockerDesktop, QualityRuntime::DockerNative] {
+            assert_eq!(
+                prerequisite_runtimes(&selected, true),
+                [Some(default.clone()), Some(docker.clone())]
+            );
+        }
+    }
+
+    #[test]
+    fn missing_engine_messages_name_the_nix_install_and_promise_no_install() {
+        if macos() {
+            let podman = missing_podman();
+            assert!(podman.contains("profile add nixpkgs#podman"), "{podman}");
+            assert!(podman.contains("podman machine init"), "{podman}");
+            assert!(!podman.to_lowercase().contains("brew"), "{podman}");
+        } else {
             assert!(missing_podman().contains("nix profile add nixpkgs#podman"));
         }
         for text in [missing_podman(), missing_docker()] {
@@ -836,6 +889,421 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// A fake `podman` CLI with two machines and connection aliases. It records every argv, serves
+    /// fixture JSON, and "applies" a consented raise only to the machine it was sent to.
+    struct Machines {
+        dir: PathBuf,
+        program: PathBuf,
+        identity: PathBuf,
+    }
+
+    const ALIAS: &str = "podman-machine-default-work";
+
+    impl Machines {
+        fn new() -> Self {
+            let dir = scratch();
+            let identity = dir.join("machine-key");
+            fs::write(&identity, "fixture key").unwrap();
+            std::os::unix::fs::symlink(&identity, dir.join("key-alias")).unwrap();
+            fs::write(dir.join("other-key"), "unrelated key").unwrap();
+            let program = dir.join("podman");
+            script(
+                &program,
+                &format!(
+                    r#"#!/bin/sh
+d='{d}'
+printf '%s\n' "$*" >> "$d/argv.log"
+[ "$1" = --connection ] && shift 2
+case "$1 $2" in
+"system connection") cat "$d/connections.json" ;;
+"machine list") cat "$d/machines.json" ;;
+"machine inspect") cat "$d/inspect-$3.json" 2>/dev/null || {{ echo "VM does not exist" >&2; exit 125; }} ;;
+"machine ssh")
+  m=$3; shift 3
+  if [ "$1" = sudo ]; then
+    cat > "$d/raised-$m"
+    printf '524288\n1048576\n' > "$d/limits-$m"
+    if [ -f "$d/replace-on-raise" ]; then sed -i.bak 's/created-quality/created-replacement/' "$d/inspect-$m.json"; fi
+    exit 0
+  fi
+  cat "$d/limits-$m" ;;
+"info --format") cat "$d/info.json" ;;
+*) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+                    d = dir.display()
+                ),
+            );
+            let fixture = Self {
+                dir,
+                program,
+                identity,
+            };
+            let alias = fixture.dir.join("key-alias");
+            let other = fixture.dir.join("other-key");
+            fixture.connections(&[
+                (
+                    "podman-machine-default",
+                    "ssh://core@127.0.0.1:50001/run/user/501/podman/podman.sock",
+                    &fixture.identity,
+                    true,
+                ),
+                (
+                    "podman-machine-default-root",
+                    "ssh://root@127.0.0.1:50001/run/podman/podman.sock",
+                    &fixture.identity,
+                    false,
+                ),
+                (
+                    ALIAS,
+                    "ssh://core@127.0.0.1:50002/run/user/501/podman/podman.sock",
+                    &alias,
+                    false,
+                ),
+                (
+                    "quality-vm-root",
+                    "ssh://root@localhost:50002/run/podman/podman.sock",
+                    &fixture.identity,
+                    false,
+                ),
+                (
+                    "remote-box",
+                    "ssh://core@build.example:22/run/user/1000/podman/podman.sock",
+                    &fixture.identity,
+                    false,
+                ),
+                (
+                    "stale-loopback",
+                    "ssh://core@127.0.0.1:50999/run/user/501/podman/podman.sock",
+                    &fixture.identity,
+                    false,
+                ),
+                (
+                    "wrong-key",
+                    "ssh://core@127.0.0.1:50002/run/user/501/podman/podman.sock",
+                    &other,
+                    false,
+                ),
+                (
+                    "wrong-user",
+                    "ssh://admin@127.0.0.1:50002/run/user/501/podman/podman.sock",
+                    &fixture.identity,
+                    false,
+                ),
+            ]);
+            fixture.machine("podman-machine-default", 50001, "running");
+            fixture.machine("quality-vm", 50002, "running");
+            fixture.list(&["podman-machine-default", "quality-vm"]);
+            for name in ["podman-machine-default", "quality-vm"] {
+                fs::write(fixture.dir.join(format!("limits-{name}")), "65530\n65536\n").unwrap();
+            }
+            fs::write(
+                fixture.dir.join("info.json"),
+                PODMAN_ROOTLESS.replace(r#""serviceIsRemote":false"#, r#""serviceIsRemote":true"#),
+            )
+            .unwrap();
+            fixture
+        }
+        fn connections(&self, entries: &[(&str, &str, &PathBuf, bool)]) {
+            let list: Vec<Value> = entries
+                .iter()
+                .map(|(name, uri, identity, default)| {
+                    serde_json::json!({"Name": name, "URI": uri, "Identity": identity, "IsMachine": true, "Default": default, "ReadWrite": true})
+                })
+                .collect();
+            fs::write(
+                self.dir.join("connections.json"),
+                Value::from(list).to_string(),
+            )
+            .unwrap();
+        }
+        fn machine(&self, name: &str, port: u64, state: &str) {
+            let created = if name == "quality-vm" {
+                "created-quality".to_string()
+            } else {
+                format!("created-{name}")
+            };
+            let inspect = serde_json::json!([{"Name": name, "Created": created, "State": state, "Rootful": false,
+                "SSHConfig": {"IdentityPath": self.identity, "Port": port, "RemoteUsername": "core"}}]);
+            fs::write(
+                self.dir.join(format!("inspect-{name}.json")),
+                inspect.to_string(),
+            )
+            .unwrap();
+        }
+        fn list(&self, names: &[&str]) {
+            let list: Vec<Value> = names
+                .iter()
+                .map(|name| serde_json::json!({"Name": name, "Default": *name == "podman-machine-default", "Running": true}))
+                .collect();
+            fs::write(
+                self.dir.join("machines.json"),
+                Value::from(list).to_string(),
+            )
+            .unwrap();
+        }
+        fn target(&self, connection: &str) -> Result<PodmanTarget> {
+            install::podman_target(&self.program, connection, &RunControl::silent())
+        }
+        fn argv(&self) -> String {
+            fs::read_to_string(self.dir.join("argv.log")).unwrap_or_default()
+        }
+        fn raise_script(&self) -> PathBuf {
+            let path = self.dir.join("raise.sh");
+            fs::write(&path, "# fixed consented helper\n").unwrap();
+            path
+        }
+    }
+
+    impl Drop for Machines {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn bound(name: &str, created: &str) -> PodmanTarget {
+        PodmanTarget::Machine(MachineBinding {
+            name: name.into(),
+            created: created.into(),
+            running: true,
+        })
+    }
+
+    #[test]
+    fn connection_alias_binds_by_endpoint_user_and_identity_never_by_name() {
+        let fixture = Machines::new();
+        // The alias's name points at the default machine; its endpoint (and a symlinked key) is the other one.
+        assert_eq!(
+            fixture.target(ALIAS).unwrap(),
+            bound("quality-vm", "created-quality")
+        );
+        assert_eq!(
+            fixture.target("quality-vm-root").unwrap(),
+            bound("quality-vm", "created-quality")
+        );
+        assert_eq!(
+            fixture.target("").unwrap(),
+            bound("podman-machine-default", "created-podman-machine-default")
+        );
+        assert_eq!(
+            fixture.target("podman-machine-default-root").unwrap(),
+            bound("podman-machine-default", "created-podman-machine-default")
+        );
+        for remote in ["remote-box", "stale-loopback", "wrong-key", "wrong-user"] {
+            assert_eq!(
+                fixture.target(remote).unwrap(),
+                PodmanTarget::Remote,
+                "{remote}"
+            );
+        }
+        let missing = fixture
+            .target("podman-machine-default-missing")
+            .unwrap_err();
+        assert!(missing.contains("is not configured"), "{missing}");
+        assert!(fixture.target("--connection").is_err());
+    }
+
+    #[test]
+    fn consented_raise_reaches_only_the_bound_machine() {
+        let fixture = Machines::new();
+        let control = RunControl::silent();
+        raise_in_machine(&fixture.program, ALIAS, &fixture.raise_script(), &control).unwrap();
+        assert_eq!(
+            fs::read_to_string(fixture.dir.join("raised-quality-vm")).unwrap(),
+            "# fixed consented helper\n",
+            "the fixed script travels on stdin to the bound machine"
+        );
+        assert!(!fixture.dir.join("raised-podman-machine-default").exists());
+        let argv = fixture.argv();
+        assert!(
+            argv.contains("machine ssh quality-vm sudo -n /bin/sh -s"),
+            "{argv}"
+        );
+        assert!(
+            !argv.contains("machine ssh podman-machine-default"),
+            "{argv}"
+        );
+        assert_eq!(
+            machine_limits(&fixture.program, "podman-machine-default", &control),
+            (Some(65_530), Some(65_536)),
+            "the unrelated running default machine keeps its limits"
+        );
+        assert_eq!(
+            machine_limits(&fixture.program, "quality-vm", &control),
+            (Some(524_288), Some(1_048_576))
+        );
+    }
+
+    #[test]
+    fn remote_connection_serves_engine_operations_without_vm_authority() {
+        let fixture = Machines::new();
+        let control = RunControl::silent();
+        assert_eq!(
+            podman_machine(&fixture.program, "remote-box", &control).unwrap(),
+            None
+        );
+        assert_eq!(
+            raise_in_machine(
+                &fixture.program,
+                "remote-box",
+                &fixture.raise_script(),
+                &control
+            )
+            .unwrap_err(),
+            REMOTE_LIMITS
+        );
+        assert!(
+            !fixture.argv().contains("machine ssh"),
+            "{}",
+            fixture.argv()
+        );
+    }
+
+    #[test]
+    fn default_stopped_and_ambiguous_associations_fail_actionably() {
+        let fixture = Machines::new();
+        let control = RunControl::silent();
+        fixture.machine("quality-vm", 50002, "stopped");
+        assert_eq!(
+            fixture.target(ALIAS).unwrap(),
+            PodmanTarget::Machine(MachineBinding {
+                name: "quality-vm".into(),
+                created: "created-quality".into(),
+                running: false
+            })
+        );
+        let stopped = podman_machine(&fixture.program, ALIAS, &control).unwrap_err();
+        assert!(
+            stopped.contains("podman machine start quality-vm"),
+            "{stopped}"
+        );
+        assert!(
+            raise_in_machine(&fixture.program, ALIAS, &fixture.raise_script(), &control).is_err()
+        );
+        assert!(!fixture.dir.join("raised-quality-vm").exists());
+        fixture.machine("quality-vm", 50002, "running");
+
+        fixture.machine("clone-vm", 50002, "running");
+        fixture.list(&["podman-machine-default", "quality-vm", "clone-vm"]);
+        let ambiguous = fixture.target(ALIAS).unwrap_err();
+        assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+        fixture.list(&["podman-machine-default", "quality-vm"]);
+
+        let alias = fixture.dir.join("key-alias");
+        fixture.connections(&[(
+            ALIAS,
+            "ssh://core@127.0.0.1:50002/run/user/501/podman/podman.sock",
+            &alias,
+            false,
+        )]);
+        let no_default = fixture.target("").unwrap_err();
+        assert!(no_default.contains("podman machine init"), "{no_default}");
+        fixture.connections(&[(
+            "remote-box",
+            "ssh://core@build.example:22/run/user/1000/podman/podman.sock",
+            &fixture.identity,
+            true,
+        )]);
+        let remote_default = fixture.target("").unwrap_err();
+        assert!(
+            remote_default.contains("does not address"),
+            "{remote_default}"
+        );
+        assert_eq!(fixture.target("remote-box").unwrap(), PodmanTarget::Remote);
+    }
+
+    #[test]
+    fn a_machine_replaced_during_the_raise_is_never_reported_as_raised() {
+        let fixture = Machines::new();
+        fs::write(fixture.dir.join("replace-on-raise"), "").unwrap();
+        let error = raise_in_machine(
+            &fixture.program,
+            ALIAS,
+            &fixture.raise_script(),
+            &RunControl::silent(),
+        )
+        .unwrap_err();
+        assert!(error.contains("could not be verified"), "{error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_uses_one_verified_machine_association() {
+        let fixture = Machines::new();
+        let control = RunControl::silent();
+        let alias = CliEngine::scripted(
+            QualityRuntime::Podman {
+                connection: ALIAS.into(),
+            },
+            fixture.program.clone(),
+            &fixture.dir,
+        );
+        let found = probe(&alias, &control).unwrap();
+        assert!(
+            found.fingerprint.ends_with(":created-quality"),
+            "{}",
+            found.fingerprint
+        );
+        assert_eq!(
+            (found.max_map_count, found.file_max),
+            (Some(65_530), Some(65_536))
+        );
+        let argv = fixture.argv();
+        assert!(
+            argv.contains(&format!("--connection {ALIAS} info")),
+            "{argv}"
+        );
+        assert!(argv.contains("machine ssh quality-vm cat"), "{argv}");
+        assert!(
+            !argv.contains("machine ssh podman-machine-default"),
+            "{argv}"
+        );
+
+        let default = CliEngine::scripted(
+            QualityRuntime::Podman {
+                connection: String::new(),
+            },
+            fixture.program.clone(),
+            &fixture.dir,
+        );
+        assert!(probe_fingerprint_of(&default).ends_with(":created-podman-machine-default"));
+
+        fs::remove_file(fixture.dir.join("argv.log")).unwrap();
+        let remote = CliEngine::scripted(
+            QualityRuntime::Podman {
+                connection: "remote-box".into(),
+            },
+            fixture.program.clone(),
+            &fixture.dir,
+        );
+        let found = probe(&remote, &control).unwrap();
+        assert!(found.fingerprint.ends_with(':'), "{}", found.fingerprint);
+        assert_eq!((found.max_map_count, found.file_max), (None, None));
+        assert!(
+            !fixture.argv().contains("machine ssh"),
+            "{}",
+            fixture.argv()
+        );
+        let notes = runtime_notes(remote.runtime(), &found).unwrap();
+        assert!(notes.contains("unknown"), "{notes}");
+
+        let missing = CliEngine::scripted(
+            QualityRuntime::Podman {
+                connection: "deleted-alias".into(),
+            },
+            fixture.program.clone(),
+            &fixture.dir,
+        );
+        assert!(probe(&missing, &control)
+            .unwrap_err()
+            .contains("is not configured"));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn probe_fingerprint_of(engine: &CliEngine) -> String {
+        probe(engine, &RunControl::silent()).unwrap().fingerprint
     }
 
     /// The raise path against a fake `pkexec` that records its argv and stdin and "applies" the change

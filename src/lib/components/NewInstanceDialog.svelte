@@ -102,7 +102,7 @@
     <form class="dialog panel" onsubmit={submit}>
       <header><h3>{purpose === "manager" ? "Set up The Manager" : purpose === "architect" ? "Set up The Architect" : "New OMP instance"}</h3><span class="spacer"></span><button type="button" onclick={onclose} disabled={busy}>Close</button></header>
       <div class="body form">
-        <label>Working directory <div class="row"><input bind:value={projectPath} required placeholder="C:/path/to/project" /><button type="button" onclick={browse}>Browse…</button></div></label>
+        <label>Working directory <div class="row"><input bind:value={projectPath} required placeholder={typeof navigator !== "undefined" && /Win/i.test(navigator.platform) ? "C:/path/to/project" : "/path/to/project"} /><button type="button" onclick={browse}>Browse…</button></div></label>
         {#if sessions.length > 0}
           <label>Reconnect to an existing session
             <div class="row"><select bind:value={resume} disabled={loading}>

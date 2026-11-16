@@ -195,7 +195,7 @@ struct UserShell {
 impl UserShell {
     fn info(&self) -> UserShellInfo {
         let mut pty = self.pty.lock();
-        let exit = pty.poll().ok().flatten();
+        let exit = pty.poll().ok().flatten().or_else(|| pty.exit_code());
         UserShellInfo {
             shell_id: self.id.clone(),
             cwd: self.cwd.clone(),

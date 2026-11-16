@@ -308,6 +308,8 @@
       if (selection.missingProject) reportError("Startup project", "Saved project is unavailable; opening The Manager instead.");
       focus(selection.instanceId);
       const target = selection.instanceId ? $instancesById.get(selection.instanceId) : null;
+      // Loading desktop state is complete. Native process/browser startup must not disable navigation.
+      initializing = false;
       if (settings.autoStart && target && (target.status === "stopped" || target.status === "error")) await startInstance(target.id);
     } finally { initializing = false; }
   }
@@ -317,8 +319,8 @@
     if (!manager) return;
     openingManager = true;
     try {
-      if (manager.status === "stopped" || manager.status === "error") await startInstance(manager.id);
       focus(manager.id);
+      if (manager.status === "stopped" || manager.status === "error") await startInstance(manager.id);
     } finally { openingManager = false; }
   }
   async function openArchitect(): Promise<void> {
@@ -327,8 +329,8 @@
     if (!architect) return;
     openingArchitect = true;
     try {
-      if (architect.status === "stopped" || architect.status === "error") await startInstance(architect.id);
       focus(architect.id);
+      if (architect.status === "stopped" || architect.status === "error") await startInstance(architect.id);
     } finally { openingArchitect = false; }
   }
   // Dependency workflows open the existing Architect only: resume it without starting a new session, replay a saved result before focusing, never create a replacement.

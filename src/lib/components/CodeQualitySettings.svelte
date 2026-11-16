@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import { api } from "../api";
   import { codeQualityClient } from "../code-quality-client";
-  import { defaultQualityConfig, featuresVisible, installVisible, modeLabel, modeSelectors, qualityLocked, runtimeLabel, selectorMode, setupAction, type QualityConfig, type QualityCredentialUpdate, type QualityRuntime } from "../code-quality";
+  import { credentialCheckPending, defaultQualityConfig, featuresVisible, installVisible, modeLabel, modeSelectors, qualityLocked, runtimeLabel, selectorMode, setupAction, type QualityConfig, type QualityCredentialUpdate, type QualityRuntime } from "../code-quality";
   import CodeQualityOwnership from "./CodeQualityOwnership.svelte";
   import CodeQualityCredentials from "./CodeQualityCredentials.svelte";
   let { enterOnAcquire = true }: { enterOnAcquire?: boolean } = $props();
@@ -76,6 +76,10 @@
     <p role="status"><strong>{quality.suspended ? "Stopped" : quality.phase}</strong>{quality.busy ? " · operation in progress" : ""}{!quality.activated ? " · not yet activated" : ""}<br />Committed: {modeLabel(quality.config.mode)} · {runtimeLabel(quality.config.runtime)}<br />Effective: {modeLabel(quality.effectiveMode)}</p>
     {#if quality.requestedConfig}<p class="warn">Requested: {modeLabel(quality.requestedConfig.mode)} · {runtimeLabel(quality.requestedConfig.runtime)}</p>{/if}
     {#if quality.error}<p class="err" role="alert">{quality.error}</p>{/if}
+    {#if quality.ownership.status === "owned"}
+      {#if credentialCheckPending(quality)}<p role="status">Checking credentials…</p>
+      {:else if quality.credentials.error}<p class="err" role="alert">{quality.credentials.error}. Unlock the operating system credential store, then use Recheck.</p>{/if}
+    {/if}
     {#if quality.phase === "needsRestart"}<p class="warn">Restart Windows manually, then reopen Code quality and press Continue setup. OMP Manager never reboots Windows.</p>{/if}
     {#if quality.phase === "needsSetup"}<p class="warn">{quality.setup.installRequired ? "Setup is required. Open Code quality and press Install and setup." : "Open Code quality and press Start and scan."} Changing a selector does not install software.</p>{/if}
   {/if}
@@ -116,7 +120,9 @@
     {#each quality?.prerequisites ?? [] as prerequisite}
       <p><strong>{runtimeLabel(prerequisite.runtime)}</strong>: {prerequisite.ready ? "ready" : prerequisite.installed ? "installed, not ready" : "not installed"}{prerequisite.needsRestart ? " · restart required" : ""}<br />{prerequisite.message ?? ""}</p>
     {/each}
-      {#if quality?.credentialStore}<p class:err={!quality.credentialStore.available}>{quality.credentialStore.name}: {quality.credentialStore.message ?? "available"}</p>{/if}
+    {#if quality?.credentialStore && quality.ownership.status === "owned" && quality.credentials.checked}
+      <p class:err={!!quality.credentials.error}>{quality.credentialStore.name}: {quality.credentials.error ? (quality.credentialStore.message ?? quality.credentials.error) : "available"}</p>
+    {/if}
   </fieldset>
   {#if dirty && quality && revision !== quality.revision}<p class="warn">Settings changed in another surface. Your draft is preserved; reload it before applying.</p><button disabled={locked} onclick={() => { if (quality) { draft = structuredClone(quality.config); revision = quality.revision; ({ analyzer, connection } = modeSelectors(quality.config.mode)); dirty = false; token = ""; tokenAction = "keep"; } }}>Reload committed settings</button>{/if}
   {#if mode === "alternate" && quality && !quality.rules.acknowledged}<p class="warn">Acknowledge the rules license under Advanced / manual setup before applying.</p>{/if}
@@ -135,7 +141,10 @@
             <button type="button" disabled={!quality?.community.url} onclick={() => perform(() => api.openCodeQualityDashboard())}>Open SonarQube setup</button>
             <small class="dim">On a fresh server OMP Manager owns, it sets a random admin password and creates the scan token itself. Use the token controls below only if that was not possible (for example the admin password was changed elsewhere): create a user token in SonarQube's My Account → Security.</small>
           {/if}
-          <p>Saved token for the committed connection: {credentialPresent ? "present" : "missing"}. Tokens need Browse + Execute Analysis; Community project creation also needs permission. A different server/context or local runtime has separate credentials.</p>
+          {#if quality?.ownership.status === "owned" && quality.credentials.checked && !quality.credentials.error}
+            <p>Saved token for the committed connection: {credentialPresent ? "present" : "missing"}.</p>
+          {/if}
+          <p>Tokens need Browse + Execute Analysis; Community project creation also needs permission. A different server/context or local runtime has separate credentials.</p>
           <label>Token update<select bind:value={tokenAction}><option value="keep">Keep saved token</option><option value="replace">Replace token</option><option value="clear">Clear saved token</option></select></label>
           {#if tokenAction === "replace"}<label>User token<input type="password" autocomplete="new-password" spellcheck="false" bind:value={token} /></label>{/if}
           {#if tokenAction === "clear"}<small class="warn">Clear disables scans for this connection; it does not shut down unchanged Community.</small>{/if}

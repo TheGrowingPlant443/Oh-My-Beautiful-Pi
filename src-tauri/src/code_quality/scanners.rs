@@ -908,7 +908,7 @@ fn prepare_image(
 ) -> Result<String> {
     let image = image_for(project, stage)?;
     if !engine.image_exists(&image, control)? {
-        engine.pull(&image, control)?;
+        engine.pull(&image, None, control)?;
     }
     if project.scanner != Scanner::Dotnet {
         return Ok(image);
@@ -920,7 +920,7 @@ fn prepare_image(
     let derived = format!("localhost/omp-quality-dotnet:{}", &digest[..24]);
     if !engine.image_exists(&derived, control)? {
         write_asset(&context.join("Dockerfile"), &dockerfile)?;
-        engine.build_image(&derived, &context, control)?;
+        engine.build_image(&derived, &context, None, control)?;
     }
     Ok(derived)
 }

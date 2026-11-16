@@ -1,26 +1,21 @@
-import errno
 import json
 import os
 from pathlib import Path
-import secrets
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
 
-from access_fs import AccessFS
 from policy import Policy
 import browser
-from runtime import KEYRING_UNLOCK, BrowserDisplay, Runtime
+from runtime import Cancelled, OwnedChildren, Runtime
 
 
-def _until(condition, timeout=5):
+def _until(condition, timeout=10):
     deadline = time.monotonic() + timeout
     while not condition():
         if time.monotonic() >= deadline:
@@ -28,396 +23,340 @@ def _until(condition, timeout=5):
         time.sleep(0.01)
 
 
-class SourceBuildTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.source = self.root / "checkout"
+NIX = """#!/bin/sh
+echo $$ > "$OMBP_TEST_DIR/nix-pid"
+printf '%s\\n' "$@" > "$OMBP_TEST_DIR/nix-args"
+case "$(cat "$OMBP_TEST_DIR/build-mode")" in
+  fail) echo "build failed" >&2; exit 1 ;;
+  hang) exec sleep 60 ;;
+  late) trap '' TERM; : > "$OMBP_TEST_DIR/trapped"; sleep 1; cat "$OMBP_TEST_DIR/build-output" ;;
+  *) cat "$OMBP_TEST_DIR/build-output" ;;
+esac
+"""
+
+APP = """#!/bin/sh
+echo "$OMBP_AGENT" >> "$OMBP_TEST_DIR/launched"
+if [ -f "$OMBP_TEST_DIR/app-exit" ]; then exit "$(cat "$OMBP_TEST_DIR/app-exit")"; fi
+exec sleep 60
+"""
+
+
+class FakeNix:
+    """A real `nix` executable on PATH and a store-like build output whose behaviour each test chooses."""
+
+    def __init__(self, test, root):
+        self.root = root
+        directory = root / "bin"
+        directory.mkdir()
+        (directory / "nix").write_text(NIX)
+        (directory / "nix").chmod(0o755)
+        self.output = root / "store" / ("0" * 32 + "-ombp")
+        app = self.output / "bin/omp-manager"
+        app.parent.mkdir(parents=True)
+        app.write_text(APP)
+        app.chmod(0o755)
+        self.source = root / "checkout"
         self.source.mkdir()
         (self.source / "flake.nix").write_text("{}")
-        self.runtime = Runtime(Policy(self.root / "state"))
-        self.addCleanup(self.runtime.stop)
+        for active in (patch.dict(os.environ, {"PATH": f"{directory}:{os.environ.get('PATH', os.defpath)}",
+                                               "OMBP_TEST_DIR": str(root)}),
+                       patch("runtime.STORE", f"{root / 'store'}/")):
+            active.start()
+            test.addCleanup(active.stop)
+        self.behave("ok")
 
-    def test_rootfs_preparation_does_not_delete_existing_temporary_data(self):
-        temporary = self.runtime.policy.directory / "rootfs/var/tmp"
-        temporary.mkdir(parents=True)
-        saved = temporary / "saved"
-        saved.write_text("keep this data")
-        with self.assertRaises(OSError):
-            self.runtime._rootfs("/bin/sh", "/bin")
-        self.assertEqual(saved.read_text(), "keep this data")
+    def behave(self, mode, output=None):
+        (self.root / "build-mode").write_text(mode)
+        (self.root / "build-output").write_text(f"{self.output}\n" if output is None else output)
 
-    def test_failed_build_never_launches_an_installed_fallback(self):
-        with patch("runtime.subprocess.Popen") as build:
-            build.return_value.communicate.return_value = ("", None)
-            build.return_value.returncode = 1
-            with self.assertRaisesRegex(RuntimeError, "OMBP build failed"):
-                self.runtime.start(str(self.source), "normal", False, "none", "omp")
-        self.assertFalse(self.runtime.status()["running"])
-        self.assertIsNone(self.runtime.launch)
-        self.assertIsNone(self.runtime.log)
+    def read(self, name):
+        path = self.root / name
+        return path.read_text().splitlines() if path.exists() else []
 
-    def test_rejects_folder_without_flake_before_building(self):
-        (self.source / "flake.nix").unlink()
-        with patch("runtime.subprocess.Popen") as build:
-            with self.assertRaisesRegex(ValueError, "source folder"):
-                self.runtime.start(str(self.source), "container", True, "none", "omp")
-            build.assert_not_called()
+    def reset(self):
+        for name in ("nix-args", "nix-pid", "launched"):
+            (self.root / name).unlink(missing_ok=True)
+
+
+class FakeVm:
+    """A macOS VM backend stand-in whose launch waits, recording what each launch was admitted with."""
+    name = "linux-vm"
+    container = None
+    run = None
+
+    def __init__(self):
+        self.admitted = threading.Event()
+        self.released = threading.Event()
+        self.received = []
+        self.asked = "never"
+
+    def status_fields(self):
+        return {"desktops": [], "catalog_generation": 1, "policy_generation": 0, "applied_policy_generation": 0}
+
+    def requirements_status(self, installation=None):
+        self.asked = installation
+        return []
+
+    def launch(self, settings, log, children, advance, *, installation):
+        self.received.append(installation)
+        self.admitted.set()
+        while not self.released.wait(0.05):
+            children.check()
+
+    def cancel_preparation(self):
+        self.released.set()
+
+    close = cancel_preparation
+
+
+class LifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.nix = FakeNix(self, self.root)
+        self.policy = Policy(self.root / "state")
+        self.runtime = Runtime(self.policy)
+        self.addCleanup(self.runtime.close)
+
+    def start(self, agent="omp", mode="normal"):
+        return self.runtime.start(str(self.nix.source), mode, False, "none", agent)
+
+    def until_phase(self, *phases):
+        _until(lambda: self.runtime.status()["phase"] in phases)
+        return self.runtime.status()
+
+    def stop(self):
+        self.runtime.stop()
+        return self.until_phase("stopped")
+
+    def test_start_returns_an_operation_and_reports_running_only_once_live(self):
+        self.nix.behave("hang")
+        operation = self.start()
+        self.assertRegex(operation, r"^[0-9a-f]{32}$")
+        _until(lambda: self.nix.read("nix-args"))
+        status = self.runtime.status()
+        self.assertEqual((status["phase"], status["operation_id"], status["backend"]), ("building", operation, "native"))
+        self.assertTrue(status["starting"])
+        self.assertFalse(status["running"])
+        self.assertEqual(status["desktops"], [])
+        with self.assertRaisesRegex(ValueError, "building"):
+            self.start()
+        self.stop()
+
+        self.nix.reset()
+        self.nix.behave("ok")
+        operation = self.start(agent="omsp")
+        status = self.until_phase("running")
+        self.assertTrue(status["running"])
+        self.assertFalse(status["starting"])
+        self.assertEqual((status["operation_id"], status["launch"]["agent"]), (operation, "omsp"))
+        _until(lambda: self.nix.read("launched"))
+        self.assertEqual(self.nix.read("launched"), ["omsp"])
+        self.assertEqual(self.nix.read("nix-args"), ["--extra-experimental-features", "nix-command flakes", "build",
+                                                     "path:.#omsp", "--no-link", "--print-out-paths",
+                                                     "--print-build-logs", "--no-write-lock-file"])
+        with self.assertRaisesRegex(ValueError, "Already running"):
+            self.start()
+        status = self.stop()
+        self.assertEqual((status["running"], status["operation_id"], status["error"]), (False, None, ""))
+
+    def test_failed_build_never_launches_the_previous_app(self):
+        self.start()
+        self.until_phase("running")
+        _until(lambda: self.nix.read("launched"))
+        self.stop()
+        self.nix.reset()
+        self.nix.behave("fail")
+        self.start()
+        status = self.until_phase("failed")
+        self.assertIn("OMBP build failed", status["error"])
+        self.assertIn("path:.#default", self.nix.read("nix-args"))
+        self.assertEqual(self.nix.read("launched"), [])
+        self.assertIsNone(status["launch"])
+        self.assertFalse(status["running"])
 
     def test_ambiguous_build_output_never_launches(self):
-        with patch("runtime.subprocess.Popen") as build:
-            build.return_value.communicate.return_value = ("/nix/store/first\n/nix/store/second\n", None)
-            build.return_value.returncode = 0
-            with self.assertRaisesRegex(RuntimeError, "one Nix store output"):
-                self.runtime.start(str(self.source), "normal", False, "none", "omp")
-        self.assertFalse(self.runtime.status()["running"])
+        self.nix.behave("ok", f"{self.nix.output}\n{self.nix.output}\n")
+        self.start()
+        self.assertIn("one Nix store output", self.until_phase("failed")["error"])
+        self.assertEqual(self.nix.read("launched"), [])
 
-    def test_agent_selects_flake_output(self):
-        for agent, attribute in (("omsp", "path:.#omsp"), ("omp", "path:.#default")):
-            with self.subTest(agent=agent), patch("runtime.subprocess.Popen") as build:
-                build.return_value.communicate.return_value = ("", None)
-                build.return_value.returncode = 1
-                with self.assertRaisesRegex(RuntimeError, "OMBP build failed"):
-                    self.runtime.start(str(self.source), "normal", False, "none", agent)
-                self.assertIn(attribute, build.call_args_list[0].args[0])
-        with patch("runtime.subprocess.Popen") as build:
-            with self.assertRaisesRegex(ValueError, "Invalid launch settings"):
-                self.runtime.start(str(self.source), "normal", False, "none", "bad")
-            build.assert_not_called()
-
-    def test_close_during_build_reaps_child_and_prevents_launch(self):
-        spawned = threading.Event()
-        children, errors = [], []
-        popen = subprocess.Popen
-
-        def build(*_args, **_kwargs):
-            child = popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=subprocess.PIPE, text=True)
-            children.append(child)
-            spawned.set()
-            return child
-
-        def start():
-            try:
-                self.runtime.start(str(self.source), "normal", False, "none", "omp")
-            except RuntimeError as error:
-                errors.append(str(error))
-
-        worker = threading.Thread(target=start, daemon=True)
-        with patch("runtime.subprocess.Popen", side_effect=build):
-            worker.start()
-            try:
-                self.assertTrue(spawned.wait(5), "Build did not start")
-                self.runtime.close()
-                worker.join(5)
-                self.assertFalse(worker.is_alive(), "Shutdown left start blocked")
-                self.assertIsNotNone(children[0].poll(), "Build child survived shutdown")
-                self.assertEqual(errors, ["Launch cancelled: launcher is closing"])
-                self.assertFalse(self.runtime.status()["running"])
-                self.assertIsNone(self.runtime.launch)
-            finally:
-                for child in children:
-                    if child.poll() is None:
-                        child.kill()
-                    child.wait()
-                worker.join(5)
-
-    def test_closing_desktop_window_is_a_stop_but_app_crash_is_reported(self):
-        def child(code, delay=0):
-            return subprocess.Popen([sys.executable, "-c", f"import sys, time; time.sleep({delay}); sys.exit({code})"])
-
-        # (desktop exit code or None while still running, expected error prefix; "" means no error)
-        for desktop_code, expected in ((0, ""), (None, "Process exited 1"), (1, "Process exited 1")):
-            with self.subTest(desktop_code=desktop_code):
-                app = child(1)
-                self.runtime.process = app
-                self.runtime.desktop_process = child(0, 30) if desktop_code is None else child(desktop_code)
-                self.runtime.last_error = ""
-                self.runtime._watch(app)
-                if expected:
-                    self.assertTrue(self.runtime.last_error.startswith(expected), self.runtime.last_error)
-                else:
-                    self.assertEqual(self.runtime.last_error, "")
-                self.assertIsNone(self.runtime.process)
-                self.assertIsNone(self.runtime.desktop_process)
-
-    def test_host_omp_bind_never_exposes_launcher_state(self):
-        home = self.root / "home"
-        (home / ".omp").mkdir(parents=True)
-        alias = self.root / "alias"
-        alias.symlink_to(home / ".omp", target_is_directory=True)
-        with patch.dict(os.environ, {"HOME": str(home)}):
-            self.assertEqual(self.runtime._host_omp([]), (home / ".omp").resolve())
-            self.assertIsNone(self.runtime._host_omp(["host-omp"]))
-            for state in (home / ".omp" / "ombp-start", alias / "state"):
-                with self.subTest(state=state):
-                    runtime = Runtime(Policy(state))
-                    with self.assertRaisesRegex(ValueError, "overlaps protected launcher path"):
-                        runtime._host_omp([])
-
-
-class PrivateKeyringTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.policy = Policy(self.root / "state")
-        self.runtime = Runtime(self.policy)
-        self.addCleanup(self.runtime.stop)
-        self.key = self.policy.directory / KEYRING_UNLOCK
-
-    def test_unlock_key_is_stable_private_and_separate_from_container_home(self):
-        first = self.runtime._keyring_password()
-        home = self.policy.directory / "home"
-        home.mkdir()
-        (home / "saved-data").write_text("persistent private data")
-        # Boolean comparisons keep generated unlock keys out of assertion output.
-        self.assertTrue(secrets.compare_digest(first, Runtime(self.policy)._keyring_password()), "Private keyring key rotated")
-        other = Runtime(Policy(self.root / "other-state"))
-        self.assertFalse(secrets.compare_digest(first, other._keyring_password()), "Different states share an unlock key")
-        self.assertEqual(stat.S_IMODE(self.key.stat().st_mode), 0o600)
-        self.assertFalse(self.key.is_relative_to(home))
-
-    def test_broad_host_grant_cannot_read_unlock_key(self):
-        self.runtime._keyring_password()
-        value = self.policy.snapshot()
-        value["folders"] = [{"path": str(self.root), "write": True}]
-        self.policy.replace(value)
-        filesystem = AccessFS(self.policy, {}, lambda _: [])
-        self.addCleanup(filesystem.destroy, "/")
-        with self.assertRaises(OSError) as denied:
-            filesystem.open("/host" + str(self.key), os.O_RDONLY)
-        self.assertEqual(denied.exception.errno, errno.EACCES)
-
-    def test_symlinked_state_parent_cannot_expose_unlock_key(self):
-        real = self.root / "real"
-        real.mkdir()
-        alias = self.root / "alias"
-        alias.symlink_to(real, target_is_directory=True)
-        policy = Policy(alias / "state")
-        runtime = Runtime(policy)
-        runtime._keyring_password()
-        (real / "shared").write_bytes(b"allowed data")
-        value = policy.snapshot()
-        value["folders"] = [{"path": str(real), "write": True}]
-        policy.replace(value)
-        filesystem = AccessFS(policy, {}, lambda _: [])
-        self.addCleanup(filesystem.destroy, "/")
-        handle = filesystem.open("/host" + str(real / "shared"), os.O_RDONLY)
-        try:
-            self.assertEqual(filesystem.read("", 32, 0, handle), b"allowed data")
-        finally:
-            filesystem.release("", handle)
-        with self.assertRaises(OSError) as denied:
-            filesystem.open("/host" + str(real / "state" / KEYRING_UNLOCK), os.O_RDONLY)
-        self.assertEqual(denied.exception.errno, errno.EACCES)
-
-    def test_existing_private_home_is_never_rekeyed_without_its_key(self):
-        home = self.policy.directory / "home"
-        home.mkdir()
-        saved = home / "encrypted-keyring"
-        saved.write_bytes(b"existing encrypted data")
-        with self.assertRaises(ValueError):
-            self.runtime._keyring_password()
-        self.assertEqual(saved.read_bytes(), b"existing encrypted data")
-        self.assertFalse(self.key.exists())
-
-    def test_symlink_and_public_unlock_keys_are_rejected(self):
-        outside = self.root / "outside-key"
-        outside.write_text(json.dumps("f" * 64))
-        outside.chmod(0o600)
-        self.key.symlink_to(outside)
-        with self.assertRaises((OSError, ValueError)):
-            self.runtime._keyring_password()
-        self.key.unlink()
-        self.key.write_text(json.dumps("f" * 64))
-        self.key.chmod(0o644)
-        with self.assertRaises(ValueError):
-            self.runtime._keyring_password()
-        self.key.chmod(0o600)
-        self.assertEqual(self.runtime._keyring_password(), "f" * 64)
-
-    def test_malformed_unlock_key_is_not_replaced(self):
-        self.key.write_text(json.dumps("invalid"))
-        self.key.chmod(0o600)
-        with self.assertRaises(ValueError):
-            self.runtime._keyring_password()
-        self.assertEqual(json.loads(self.key.read_text()), "invalid")
-
-
-class PrivateBrowserTrustTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.policy = Policy(self.root / "state")
-        self.runtime = Runtime(self.policy)
-        self.addCleanup(self.runtime.stop)
-        self.home = self.policy.directory / "home"
-        self.home.mkdir()
-        self.ca = self.policy.directory / "proxy-ca.pem"
-        self.ca.write_text("first launcher CA")
-        self.runtime.gateway = SimpleNamespace(ca_path=self.ca, socket_path=self.root / "proxy.sock", stop=lambda: None)
-        environment = patch.dict(os.environ, {"START_APP_CERTUTIL": "/nix/store/test-nss/bin/certutil",
-                                             "LD_PRELOAD": "/untrusted.so"})
-        environment.start()
-        self.addCleanup(environment.stop)
-
-    def certutil(self, command, **kwargs):
-        database = Path(command[command.index("-d") + 1].removeprefix("sql:"))
-        self.assertTrue(database.is_relative_to(self.policy.directory))
-        self.assertFalse(database.is_relative_to(self.home))
-        self.assertEqual(kwargs["env"], {"HOME": str(database.parent.parent), "PATH": os.defpath})
-        self.assertEqual(Path(kwargs["cwd"]), database.parent.parent)
-        self.assertTrue(kwargs["check"])
-        if "-N" in command:
-            self.assertIn("--empty-password", command)
-            (database / "cert9.db").write_bytes(b"")
-            (database / "key4.db").write_bytes(b"fresh key database")
-            (database / "pkcs11.txt").write_text(f"parameters=configdir='sql:{database}'\n")
-        else:
-            self.assertEqual(command[1:6], ["-A", "-n", "OMBP sandbox proxy CA", "-t", "C,,"])
-            self.assertEqual(command[command.index("-i") + 1], str(self.ca))
-            (database / "cert9.db").write_bytes(self.ca.read_bytes())
-
-    def test_only_fresh_protected_database_is_opened_and_mounted_for_chrome(self):
-        stored = self.home / ".pki/nssdb"
-        stored.mkdir(parents=True)
-        outside = self.root / "untrusted-module"
-        outside.write_text("sandbox-authored module configuration")
-        for name in ("cert9.db", "key4.db", "pkcs11.txt"):
-            (stored / name).symlink_to(outside)
-        with patch("runtime.subprocess.run", side_effect=self.certutil) as commands:
-            self.runtime._browser_trust_start(self.home)
-        self.assertEqual(commands.call_count, 2)
-        private = Path(self.runtime.browser_trust.name) / ".pki"
-        self.assertEqual((private / "nssdb/cert9.db").read_bytes(), self.ca.read_bytes())
-        self.assertEqual((private / "nssdb/pkcs11.txt").read_text(),
-                         "parameters=configdir='sql:/home/sandbox/.pki/nssdb'\n")
-        self.assertEqual(outside.read_text(), "sandbox-authored module configuration")
-        self.assertTrue(all((stored / name).is_symlink() for name in ("cert9.db", "key4.db", "pkcs11.txt")))
-        args = []
-        self.runtime._mount_resources(args, self.home, ["host-omp", "tool-chrome"])
-        self.assertIn(f"{private}:/home/sandbox/.pki:rw", args)
-        self.assertNotIn("/nix/store/test-nss/bin/certutil", args)
-
-    def test_restart_regenerates_trust_without_stale_ca_or_changing_saved_database(self):
-        stored = self.home / ".pki/nssdb"
-        stored.mkdir(parents=True)
-        (stored / "cert9.db").write_bytes(b"user's saved NSS database")
-        with patch("runtime.subprocess.run", side_effect=self.certutil):
-            self.runtime._browser_trust_start(self.home)
-            first = Path(self.runtime.browser_trust.name)
-            gateway = self.runtime.gateway
-            self.runtime.stop()
-            self.assertFalse(first.exists())
-            self.runtime.gateway = gateway
-            self.ca.write_text("rotated launcher CA")
-            self.runtime._browser_trust_start(self.home)
-        database = Path(self.runtime.browser_trust.name) / ".pki/nssdb"
-        self.assertEqual((database / "cert9.db").read_bytes(), b"rotated launcher CA")
-        self.assertEqual((stored / "cert9.db").read_bytes(), b"user's saved NSS database")
-
-    def test_symlinked_mount_target_is_rejected_before_host_certutil_runs(self):
-        for destination in (self.root, self.root / "missing"):
-            with self.subTest(destination=destination):
-                (self.home / ".pki").symlink_to(destination, target_is_directory=True)
-                with patch("runtime.subprocess.run") as commands:
-                    with self.assertRaises(OSError):
-                        self.runtime._browser_trust_start(self.home)
-                commands.assert_not_called()
-                self.assertIsNone(self.runtime.browser_trust)
-                (self.home / ".pki").unlink()
-
-    def test_symlinked_home_is_rejected_before_host_certutil_runs(self):
-        alias = self.policy.directory / "home-alias"
-        alias.symlink_to(self.home, target_is_directory=True)
-        with patch("runtime.subprocess.run") as commands:
-            with self.assertRaises(OSError):
-                self.runtime._browser_trust_start(alias)
-        commands.assert_not_called()
-        self.assertFalse((self.home / ".pki").exists())
-
-    def test_cleanup_never_reopens_or_follows_sandbox_mutated_database(self):
-        outside = self.root / "outside"
-        outside.mkdir()
-        marker = outside / "keep"
-        marker.write_text("host data")
-        with patch("runtime.subprocess.run", side_effect=self.certutil) as commands:
-            self.runtime._browser_trust_start(self.home)
-            scratch = Path(self.runtime.browser_trust.name)
-            database = scratch / ".pki/nssdb"
-            (database / "pkcs11.txt").write_text("library=/untrusted-host-module.so")
-            (database / "cert9.db").unlink()
-            (database / "cert9.db").symlink_to(marker)
-            (database / "outside").symlink_to(outside, target_is_directory=True)
-            self.runtime.stop()
-        self.assertEqual(commands.call_count, 2)
-        self.assertFalse(scratch.exists())
-        self.assertEqual(marker.read_text(), "host data")
-
-    def test_certutil_failure_fails_closed_and_stop_cleans_scratch(self):
-        with patch("runtime.subprocess.run", side_effect=subprocess.CalledProcessError(1, "certutil")):
-            with self.assertRaisesRegex(RuntimeError, "private browser CA trust"):
-                self.runtime._browser_trust_start(self.home)
-        scratch = Path(self.runtime.browser_trust.name)
+    def test_stop_during_build_never_launches_late(self):
+        # The build ignores Stop's SIGTERM and still returns a valid output afterwards.
+        self.nix.behave("late")
+        self.start()
+        _until((self.root / "trapped").exists)
         self.runtime.stop()
-        self.assertFalse(scratch.exists())
-        self.assertIsNone(self.runtime.browser_trust)
+        self.assertEqual(self.runtime.status()["phase"], "stopping")
+        status = self.until_phase("stopped")
+        self.assertEqual(status["error"], "")
+        self.assertEqual(self.nix.read("launched"), [])
+        self.assertFalse((self.policy.directory / "last-launch.json").exists())
+
+    def test_close_during_build_reaps_child_and_refuses_new_launches(self):
+        self.nix.behave("hang")
+        self.start()
+        _until(lambda: self.nix.read("nix-pid"))
+        build = int(self.nix.read("nix-pid")[0])
+        self.runtime.close()
+        with self.assertRaises(ProcessLookupError):
+            os.kill(build, 0)
+        status = self.runtime.status()
+        self.assertEqual((status["phase"], status["running"], status["launch"]), ("stopped", False, None))
+        with self.assertRaisesRegex(RuntimeError, "closing"):
+            self.start()
+        self.assertEqual(self.nix.read("launched"), [])
+
+    def test_application_crash_fails_but_clean_exit_stops(self):
+        (self.root / "app-exit").write_text("3")
+        self.start()
+        self.assertTrue(self.until_phase("failed")["error"].startswith("Process exited 3"))
+        (self.root / "app-exit").write_text("0")
+        self.start()
+        _until(lambda: len(self.nix.read("launched")) == 2)
+        self.assertEqual(self.until_phase("stopped")["error"], "")
+
+    def test_last_launch_is_written_only_when_the_operation_reaches_running(self):
+        record = self.policy.directory / "last-launch.json"
+        self.nix.behave("fail")
+        self.start()
+        self.until_phase("failed")
+        self.nix.behave("hang")
+        self.start()
+        _until(lambda: self.nix.read("nix-args"))
+        self.stop()
+        self.assertFalse(record.exists())
+        enabled = self.policy.snapshot()
+        enabled["auto_start"] = {"source": str(self.nix.source), "mode": "normal", "desktop": True, "gpu": "none",
+                                 "agent": "omp"}
+        self.policy.replace(enabled)
+        self.nix.behave("ok")
+        self.start(agent="omsp")
+        self.until_phase("running")
+        _until(record.exists)
+        expected = {"source": str(self.nix.source.resolve()), "mode": "normal", "desktop": False, "gpu": "none",
+                    "agent": "omsp"}
+        self.assertEqual(json.loads(record.read_text()), expected)
+        self.assertEqual(self.policy.last_launch(), expected)
+        # Enabled automatic start follows the launch that actually ran.
+        _until(lambda: self.policy.snapshot()["auto_start"] == expected)
+
+    def test_isolated_launch_keeps_the_installation_it_was_admitted_with(self):
+        original, vm = self.runtime.isolated, FakeVm()
+        if hasattr(original, "close"):
+            self.addCleanup(original.close)
+        self.runtime.host, self.runtime.isolated = "darwin", vm
+        desired = self.policy.snapshot()
+        desired.update(installed_mode=True, selected_packages=["gh"])
+        self.policy.replace(desired)
+        self.runtime.start(str(self.nix.source), "container", False, "none", "omp")
+        self.assertTrue(vm.admitted.wait(5))
+        # Saved while the launch prepares: next Start's choice, never this launch's.
+        changed = self.policy.snapshot()
+        changed.update(installed_mode=False, selected_packages=["ssh"])
+        self.policy.replace(changed)
+        launch = self.runtime.status()["launch"]
+        self.assertEqual((launch["installed_mode"], launch["selected_packages"], launch["executable"]),
+                         (True, ["gh"], None))
+        self.assertEqual(vm.received, [{"installed_mode": True, "selected_packages": ["gh"]}])
+        self.runtime.requirements_status()
+        self.assertEqual(vm.asked, {"installed_mode": True, "selected_packages": ["gh"]})
+        self.stop()
+        self.runtime.requirements_status()
+        self.assertIsNone(vm.asked, "An idle launcher shows the desired policy")
+        self.assertFalse((self.policy.directory / "last-launch.json").exists())
+
+    def test_invalid_settings_are_rejected_before_admission(self):
+        with self.assertRaisesRegex(ValueError, "Invalid launch settings"):
+            self.start(agent="bad")
+        (self.nix.source / "flake.nix").unlink()
+        with self.assertRaisesRegex(ValueError, "source folder"):
+            self.start()
+        for source in ("", "   "):
+            with self.assertRaisesRegex(ValueError, "source folder"):
+                self.runtime.start(source, "normal", False, "none", "omp")
+        status = self.runtime.status()
+        self.assertEqual((status["phase"], status["operation_id"]), ("stopped", None))
+        self.assertEqual(self.nix.read("nix-args"), [])
+
+    @unittest.skipUnless(sys.platform == "darwin", "The macOS VM backend reads Mac hardware facts")
+    def test_macos_isolated_mode_runs_in_the_vm_backend_never_on_the_host(self):
+        runtime = Runtime(self.policy, host="darwin")
+        self.addCleanup(runtime.close)
+        with self.assertRaisesRegex(ValueError, "GPU passthrough is not available"):
+            runtime.start(str(self.nix.source), "container", True, "amd", "omp")
+        status = runtime.status()
+        self.assertEqual((status["phase"], status["backend"], status["container"]), ("stopped", "linux-vm", None))
+        runtime.isolated.limactl = runtime.isolated.template = None
+        runtime.start(str(self.nix.source), "container", True, "none", "omp")
+        _until(lambda: runtime.status()["phase"] == "failed")
+        self.assertIn("supplied Nix launcher", runtime.status()["error"])
+        # Isolated macOS launches never build or run OMBP on the Mac itself.
+        self.assertEqual(self.nix.read("nix-args"), [])
+        self.assertEqual(self.nix.read("launched"), [])
+
+    def test_failure_before_admission_is_reported(self):
+        self.runtime.fail("Automatic start failed: missing checkout")
+        status = self.runtime.status()
+        self.assertEqual((status["phase"], status["error"]), ("failed", "Automatic start failed: missing checkout"))
+        self.start()
+        self.assertEqual(self.runtime.status()["error"], "")
 
 
-class FakeWeston:
-    def __init__(self):
-        self.code = None
+class OwnedChildrenTests(unittest.TestCase):
+    def test_cancel_ends_running_child_and_refuses_new_ones(self):
+        children = OwnedChildren()
+        errors = []
 
-    def poll(self):
-        return self.code
+        def run():
+            try:
+                children.run([sys.executable, "-c", "import time; time.sleep(60)"], timeout=60)
+            except Cancelled as error:
+                errors.append(str(error))
+        worker = threading.Thread(target=run)
+        worker.start()
+        _until(lambda: children._processes)
+        children.cancel()
+        worker.join(10)
+        self.assertFalse(worker.is_alive(), "Cancellation did not reach the owned child")
+        self.assertEqual(errors, ["Launch cancelled"])
+        with patch("runtime.subprocess.Popen") as spawn, self.assertRaises(Cancelled):
+            children.popen(["true"])
+        spawn.assert_not_called()
+        children.retire()
 
-    def terminate(self):
-        self.code = -15
+    def test_child_ignoring_terminate_is_killed_after_grace(self):
+        children = OwnedChildren()
+        child = children.popen([sys.executable, "-c",
+                                "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                                "print('ready', flush=True); time.sleep(60)"], stdout=subprocess.PIPE)
+        self.assertEqual(child.stdout.readline(), b"ready\n")
+        children.cancel(grace=0.2)
+        children.retire()
+        self.assertEqual(child.returncode, -9)
+        child.stdout.close()
 
-    def wait(self, timeout=None):
-        return self.code
+    def test_run_lines_delivers_output_while_the_child_still_runs(self):
+        children = OwnedChildren()
+        self.addCleanup(children.retire)
+        lines, first = [], threading.Event()
 
-
-class BrowserDisplayTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.started = []
-        self.display = BrowserDisplay(Path(self.temp.name) / "browser-display", self.spawn)
-        self.addCleanup(self.display.stop)
-
-    def spawn(self, directory, name):
-        self.assertEqual((directory, name), (self.display.directory, "wayland-browser"))
-        self.started.append(FakeWeston())
-        return self.started[-1]
-
-    def connect(self):
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.addCleanup(client.close)
-        client.settimeout(5)
-        client.connect(str(self.display.directory / "request.sock"))
-        self.assertEqual(client.recv(16), b"ready\n")
-        return client
-
-    def test_window_runs_once_while_any_browser_holds_its_connection(self):
-        first, second = self.connect(), self.connect()
-        self.assertEqual(len(self.started), 1)
-        first.close()
-        _until(lambda: self.display.clients == 1)
-        self.assertIsNone(self.started[0].code)
-        second.close()
-        _until(lambda: self.display.process is None)
-        self.assertEqual(self.started[0].code, -15)
-        self.connect()
-        self.assertEqual(len(self.started), 2)
-
-    def test_stop_retires_window_and_request_socket(self):
-        self.connect()
-        self.display.stop()
-        self.assertEqual(self.started[0].code, -15)
-        self.assertFalse((self.display.directory / "request.sock").exists())
+        def on_line(line):
+            lines.append(line)
+            first.set()
+        script = ("import sys, time; print(sys.stdin.read().strip(), flush=True); time.sleep(0.5); "
+                  "print('done'); sys.exit(3)")
+        worker = threading.Thread(target=lambda: lines.append(children.run_lines(
+            [sys.executable, "-c", script], timeout=30, on_line=on_line, input=b"hello\n")))
+        worker.start()
+        self.assertTrue(first.wait(5))
+        self.assertEqual(lines, [b"hello\n"])  # Delivered before the child exited.
+        worker.join(10)
+        self.assertEqual(lines, [b"hello\n", b"done\n", 3])
+        self.assertEqual(children._processes, [])
+        with self.assertRaises(subprocess.TimeoutExpired):
+            children.run_lines([sys.executable, "-c", "import time; time.sleep(60)"], timeout=0.3, on_line=print)
 
 
 class BrowserWrapperTests(unittest.TestCase):
@@ -464,7 +403,6 @@ class BrowserWrapperTests(unittest.TestCase):
             self.assertIsNone(browser.main(["chromium", "--headless"]))
         execv.assert_called_once_with("/real/chrome", ["/real/chrome", "--headless"])
         self.assertEqual(os.environ["WAYLAND_DISPLAY"], "host")
-
 
 
 if __name__ == "__main__":

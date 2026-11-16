@@ -84,6 +84,9 @@ pub struct ContainerSpec {
     pub workdir: Option<String>,
     pub entrypoint: Option<Vec<String>>,
     pub command: Vec<String>,
+    /// Explicit `os/arch[/variant]` (e.g. `linux/amd64`) for an architecture-locked image; also used by
+    /// the automatic pull in `create`. `None` keeps the engine's native platform.
+    pub platform: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -126,9 +129,17 @@ pub trait Engine: Send + Sync {
     /// and wait until `probe` succeeds. Never stops it, never changes global defaults.
     fn ensure_started(&self, control: &RunControl) -> Result<()>;
     fn image_exists(&self, image: &str, control: &RunControl) -> Result<bool>;
-    fn pull(&self, image: &str, control: &RunControl) -> Result<()>;
-    /// Build `tag` from an app-owned context directory (never a user project).
-    fn build_image(&self, tag: &str, context_dir: &Path, control: &RunControl) -> Result<()>;
+    /// `platform`: explicit `os/arch[/variant]`, `None` for the engine's native platform.
+    fn pull(&self, image: &str, platform: Option<&str>, control: &RunControl) -> Result<()>;
+    /// Build `tag` from an app-owned context directory (never a user project) for `platform`
+    /// (`None`: the engine's native platform).
+    fn build_image(
+        &self,
+        tag: &str,
+        context_dir: &Path,
+        platform: Option<&str>,
+        control: &RunControl,
+    ) -> Result<()>;
     fn network_create(
         &self,
         name: &str,
@@ -657,15 +668,32 @@ pub(crate) fn run_machine(
 }
 
 pub(crate) fn discover_program(name: &str, standard: &[PathBuf]) -> Option<PathBuf> {
+    let executable = |path: &Path| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            path.is_file()
+        }
+    };
     if let Some(search) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&search) {
+            #[cfg(unix)]
+            if !dir.is_absolute() {
+                continue;
+            }
             let candidate = dir.join(name);
-            if candidate.is_file() {
+            if executable(&candidate) {
                 return Some(candidate);
             }
         }
     }
-    standard.iter().find(|path| path.is_file()).cloned()
+    standard.iter().find(|path| executable(path)).cloned()
 }
 
 #[cfg(windows)]
@@ -718,6 +746,38 @@ pub(crate) fn validate_selector(value: &str, kind: &str) -> Result<()> {
         Err(format!("Choose a valid explicit {kind}."))
     } else {
         Ok(())
+    }
+}
+
+/// An explicit OCI platform selector: `os/arch` or `os/arch/variant`, lower-case ASCII components.
+pub(crate) fn validate_platform(value: &str) -> Result<()> {
+    let parts: Vec<&str> = value.split('/').collect();
+    let valid = matches!(parts.len(), 2 | 3)
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 32
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid container platform '{}'; expected os/arch[/variant], for example linux/amd64.",
+            value.escape_debug()
+        ))
+    }
+}
+
+/// An engine that cannot run a foreign architecture fails builds/containers with `exec format
+/// error`. Name the missing prerequisite instead of letting it read like an analyzer failure.
+fn platform_failure(platform: Option<&str>, error: String) -> String {
+    match platform {
+        Some(platform) if error.to_lowercase().contains("exec format error") => format!(
+            "{error}\nThe selected container engine cannot execute {platform} programs: {platform} emulation is missing. Enable emulation for this engine yourself (for a Podman machine on Apple Silicon, Rosetta; on Linux, a registered binfmt emulator), then retry. Nothing was analyzed and no partial result is reported."
+        ),
+        _ => error,
     }
 }
 
@@ -869,12 +929,16 @@ impl CliEngine {
     fn create_command(&self, spec: &ContainerSpec, cpus: Option<f32>) -> Result<Command> {
         validate_selector(&spec.name, "container name")?;
         validate_selector(&spec.image, "container image")?;
+        if let Some(platform) = &spec.platform {
+            validate_platform(platform)?;
+        }
         let mut args = vec![
             "create".into(),
             "--name".into(),
             spec.name.clone(),
             "--restart=no".into(),
         ];
+        extend_flag(&mut args, "--platform", spec.platform.iter().cloned());
         extend_flag(
             &mut args,
             "--label",
@@ -1174,9 +1238,7 @@ impl CliEngine {
         // makes old resource ownership unreachable instead of silently adopted.
         let machine_identity =
             install::podman_machine_for_connection(&self.config_root, &self.runtime, control)
-                .map(|machine| {
-                    install::podman_machine_identity(&machine, control).unwrap_or_default()
-                })
+                .map(|machine| machine.created)
                 .unwrap_or_default();
         Ok(format!("podman:{id}:{graph}:{machine_identity}"))
     }
@@ -1194,7 +1256,7 @@ impl CliEngine {
                         cmd.args([
                             "machine",
                             "ssh",
-                            &machine,
+                            &machine.name,
                             "cat",
                             "/proc/sys/vm/max_map_count",
                             "/proc/sys/fs/file-max",
@@ -1329,7 +1391,7 @@ impl Engine for CliEngine {
                 let machine = install::podman_machine_for_connection(&self.config_root, &self.runtime, control)
                     .ok_or("Selected Podman connection is unreachable. Start its remote machine, or select an installed local Podman machine connection.")?;
                 let mut cmd = Command::new(&self.program);
-                cmd.args(["machine", "start", &machine]);
+                cmd.args(["machine", "start", &machine.name]);
                 run_machine(cmd, Duration::from_secs(180), control)?
                     .require_success("Start selected Podman machine")?;
             }
@@ -1351,17 +1413,35 @@ impl Engine for CliEngine {
     fn image_exists(&self, image: &str, control: &RunControl) -> Result<bool> {
         Ok(self.inspect_json("image", image, control)?.is_some())
     }
-    fn pull(&self, image: &str, control: &RunControl) -> Result<()> {
+    fn pull(&self, image: &str, platform: Option<&str>, control: &RunControl) -> Result<()> {
+        let mut args = vec!["pull"];
+        if let Some(platform) = platform {
+            validate_platform(platform)?;
+            args.extend(["--platform", platform]);
+        }
+        args.push(image);
         self.success(
-            &["pull", image],
+            &args,
             PREPARE_TIMEOUT,
             control,
             "Pull pinned analysis image",
         )
         .map(|_| ())
     }
-    fn build_image(&self, tag: &str, context_dir: &Path, control: &RunControl) -> Result<()> {
-        let mut cmd = self.command(&["build".into(), "--tag".into(), tag.into(), "-".into()]);
+    fn build_image(
+        &self,
+        tag: &str,
+        context_dir: &Path,
+        platform: Option<&str>,
+        control: &RunControl,
+    ) -> Result<()> {
+        let mut args: Vec<String> = vec!["build".into()];
+        if let Some(platform) = platform {
+            validate_platform(platform)?;
+            args.extend(["--platform".into(), platform.into()]);
+        }
+        args.extend(["--tag".into(), tag.into(), "-".into()]);
+        let mut cmd = self.command(&args);
         // WSL cannot consume Windows paths. Send a tar context on stdin on every adapter.
         let tar = self
             .config_root
@@ -1369,7 +1449,8 @@ impl Engine for CliEngine {
         snapshot::pack_dir_tar(context_dir, &tar)?;
         cmd.env("DOCKER_BUILDKIT", "1");
         let result = run_bounded(cmd, Some(&tar), PREPARE_TIMEOUT, control)
-            .and_then(|out| out.require_success("Build pinned analysis image"));
+            .and_then(|out| out.require_success("Build pinned analysis image"))
+            .map_err(|error| platform_failure(platform, error));
         let _ = fs::remove_file(tar);
         result
     }
@@ -1408,10 +1489,14 @@ impl Engine for CliEngine {
             .require_success("Create persistent owned volume")
     }
     fn create(&self, spec: &ContainerSpec, control: &RunControl) -> Result<String> {
+        // A malformed platform must fail before any inspection or pull side effect.
+        if let Some(platform) = &spec.platform {
+            validate_platform(platform)?;
+        }
         // Creating from an image that is not local would pull inside the short create timeout.
         if !self.image_exists(&spec.image, control)? {
             control.say(&format!("Downloading {} (first use only)", spec.image));
-            self.pull(&spec.image, control)?;
+            self.pull(&spec.image, spec.platform.as_deref(), control)?;
         }
         #[cfg(unix)]
         let cpus = if spec.cpus.is_some() {
@@ -1666,6 +1751,24 @@ impl EngineFactory for RuntimeFactory {
             runtime.clone(),
             &self.config_root,
         )?))
+    }
+}
+
+/// A real adapter around a fixture program (sibling native tests drive the whole probe through it).
+#[cfg(all(test, unix))]
+impl CliEngine {
+    pub(super) fn scripted(runtime: QualityRuntime, program: PathBuf, config_root: &Path) -> Self {
+        let prefix = match &runtime {
+            QualityRuntime::Podman { connection } if connection.is_empty() => Vec::new(),
+            _ => runtime_prefix(&runtime).unwrap(),
+        };
+        Self {
+            runtime,
+            program,
+            prefix,
+            config_root: config_root.to_owned(),
+            cpu_limits: Arc::new(OnceLock::new()),
+        }
     }
 }
 
@@ -1992,6 +2095,149 @@ esac"#,
                 .recover_created(&unowned, &RunControl::silent()),
             None
         );
+    }
+
+    #[test]
+    fn platform_selectors_are_strict_os_arch_variant() {
+        for valid in [
+            "linux/amd64",
+            "linux/arm64/v8",
+            "linux/386",
+            "linux/riscv64",
+        ] {
+            validate_platform(valid).unwrap();
+        }
+        for invalid in [
+            "",
+            "linux",
+            "linux/",
+            "/amd64",
+            "linux//amd64",
+            "linux/amd64/v8/extra",
+            "--platform=linux/amd64",
+            "linux/amd64 --privileged",
+            "Linux/AMD64",
+            "linux/amd64\n",
+            "linux/am-d64",
+        ] {
+            assert!(validate_platform(invalid).is_err(), "{invalid:?}");
+        }
+        let engine = fixture(QualityRuntime::Podman {
+            connection: "chosen".into(),
+        });
+        let mut spec = ContainerSpec {
+            name: "analysis".into(),
+            image: "pinned:1".into(),
+            ..ContainerSpec::default()
+        };
+        assert!(
+            !args(&engine.create_command(&spec, None).unwrap()).contains(&"--platform".to_string())
+        );
+        spec.platform = Some("linux/amd64".into());
+        let argv = args(&engine.create_command(&spec, None).unwrap());
+        let flag = argv.iter().position(|a| a == "--platform").unwrap();
+        let image = argv.iter().position(|a| a == "pinned:1").unwrap();
+        assert_eq!(
+            argv[flag + 1],
+            "linux/amd64",
+            "the selector is its own argument"
+        );
+        assert!(
+            flag < image,
+            "the platform is an engine option, not a container argument"
+        );
+        spec.platform = Some("linux/amd64 --privileged".into());
+        assert!(engine.create_command(&spec, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn platform_reaches_pull_build_and_create_and_invalid_values_have_no_side_effects() {
+        let body = r#"printf '%s\n' "$*" >> "$0.log"
+case "$1" in
+image) echo 'Error: No such image: pinned:1' >&2; exit 1;;
+pull) ;;
+create) printf '0123456789abcdef\n';;
+build) cat >/dev/null; if [ -f "$0.foreign" ]; then echo 'RUN node: exec container process `/bin/sh`: Exec format error' >&2; exit 1; fi;;
+*) exit 2;;
+esac"#;
+        let program = RuntimeProgram::new(QualityRuntime::DockerNative, body);
+        let log = program.root.join("runtime.log");
+        let control = RunControl::silent();
+        let context = program.root.join("context");
+        fs::create_dir_all(&context).unwrap();
+        fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let mut spec = ContainerSpec {
+            name: "analysis".into(),
+            image: "pinned:1".into(),
+            platform: Some("linux/amd64 --privileged".into()),
+            ..ContainerSpec::default()
+        };
+        assert!(program.engine.create(&spec, &control).is_err());
+        assert!(program
+            .engine
+            .pull("pinned:1", Some("linux"), &control)
+            .is_err());
+        assert!(program
+            .engine
+            .build_image("localhost/derived:1", &context, Some("amd64"), &control)
+            .is_err());
+        assert!(
+            !log.exists(),
+            "an invalid platform must fail before any engine call"
+        );
+
+        spec.platform = Some("linux/amd64".into());
+        assert_eq!(
+            program.engine.create(&spec, &control).unwrap(),
+            "0123456789abcdef"
+        );
+        program
+            .engine
+            .build_image(
+                "localhost/derived:1",
+                &context,
+                Some("linux/amd64"),
+                &control,
+            )
+            .unwrap();
+        program.engine.pull("native:1", None, &control).unwrap();
+        let calls: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "image inspect pinned:1",
+                "pull --platform linux/amd64 pinned:1",
+                "create --name analysis --restart=no --platform linux/amd64 pinned:1",
+                "build --platform linux/amd64 --tag localhost/derived:1 -",
+                "pull native:1",
+            ]
+        );
+
+        fs::write(program.root.join("runtime.foreign"), "").unwrap();
+        let error = program
+            .engine
+            .build_image(
+                "localhost/derived:1",
+                &context,
+                Some("linux/amd64"),
+                &control,
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("linux/amd64 emulation is missing"),
+            "{error}"
+        );
+        assert!(error.contains("no partial result"), "{error}");
+        let native = program
+            .engine
+            .build_image("localhost/native:1", &context, None, &control)
+            .unwrap_err();
+        assert!(!native.contains("emulation"), "{native}");
     }
 
     #[cfg(target_os = "linux")]
@@ -2364,7 +2610,7 @@ esac"#
         .is_err());
     }
     #[test]
-    fn discovery_uses_the_first_existing_standard_file_when_path_has_no_match() {
+    fn discovery_skips_unusable_candidates() {
         let name = format!("omp-runtime-discovery-{}", Uuid::new_v4());
         let root = std::env::temp_dir().join(&name);
         fs::create_dir_all(&root).unwrap();
@@ -2372,12 +2618,23 @@ esac"#
         let second = root.join("second");
         fs::write(&first, b"").unwrap();
         fs::write(&second, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&first, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&second, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let expected = if cfg!(unix) {
+            second.clone()
+        } else {
+            first.clone()
+        };
         assert_eq!(
             discover_program(
                 &name,
                 &[root.clone(), root.join("missing"), first.clone(), second]
             ),
-            Some(first)
+            Some(expected)
         );
         fs::remove_dir_all(root).unwrap();
     }

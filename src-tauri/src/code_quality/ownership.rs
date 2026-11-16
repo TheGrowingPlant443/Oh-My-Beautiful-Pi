@@ -23,7 +23,7 @@ const CLOSE_OTHER: &str = "The other OMP Manager must finish closing before cont
 
 pub(crate) struct Ownership {
     pub lock: Option<ProcessLock>,
-    instance_id: String,
+    pub(super) instance_id: String,
     pub handed_off: bool,
     pub transferring: bool,
     listener: Option<ListenerHandle>,
@@ -363,7 +363,7 @@ impl CodeQualityService {
         Ok(())
     }
 
-    /// File-only acquisition: never starts an engine, including when called by polling.
+    /// Acquisition never starts an engine; credential presence is refreshed by a tracked worker.
     pub fn refresh_ownership(self: &Arc<Self>) -> Result<()> {
         if self.closing.load(Ordering::Relaxed) {
             return Ok(());
@@ -372,10 +372,19 @@ impl CodeQualityService {
         if ownership.lock.is_some() || ownership.handed_off || ownership.transferring {
             return Ok(());
         }
-        self.acquire_owner_locked(&mut ownership)
+        self.acquire_owner_locked(&mut ownership)?;
+        let acquired = ownership.lock.is_some();
+        drop(ownership);
+        if acquired {
+            let _ = self.schedule_credential_refresh();
+        }
+        Ok(())
     }
 
     fn acquire_owner_locked(self: &Arc<Self>, ownership: &mut Ownership) -> Result<()> {
+        if self.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let Some(lock) = ProcessLock::acquire(&super::process_lock::name_for(&self.paths.root))?
         else {
             return Ok(());
@@ -393,6 +402,7 @@ impl CodeQualityService {
         match loaded {
             Ok((file, installation)) => {
                 let mut inner = self.inner.lock();
+                self.invalidate_credentials(&mut inner);
                 inner.file = file;
                 inner.installation = installation;
                 inner.fatal = None;
@@ -414,7 +424,6 @@ impl CodeQualityService {
         }
         ownership.handed_off = false;
         self.refresh_rules();
-        self.refresh_credentials();
         self.recover_interrupted_jobs();
         if let Err(error) = self.publish_owner_locked(ownership) {
             let mut inner = self.inner.lock();
@@ -446,6 +455,7 @@ impl CodeQualityService {
         let result = self.request_handover();
         self.ownership.lock().transferring = false;
         result?;
+        let _ = self.schedule_credential_refresh();
         Ok(self.state())
     }
 
@@ -607,6 +617,7 @@ impl CodeQualityService {
             let _ = std::fs::remove_file(self.paths.root.join("owner.json"));
         }
         ownership.handed_off = handed_off;
+        self.invalidate_credentials(&mut self.inner.lock());
         // This is LAST: only a new mutex holder may now publish a descriptor or mutate resources.
         ownership.lock.take();
     }

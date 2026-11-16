@@ -1,9 +1,11 @@
 """Live, fail-closed host-folder and Nix-store views for a rootless container.
 
 Mount with raw_fi=True and zero attribute/entry/negative cache timeouts. Host
-files use direct IO; immutable store files retain executable mmap support. Host
-symlinks, multiply-linked files and nested mounts are intentionally unavailable;
-Nix symlinks may only resolve within the currently approved closure roots.
+files use direct IO; immutable store files retain executable mmap support.
+`/host` is served by an injected host-files implementation (host_files.HostFiles
+on Linux, file_broker.RemoteHostFiles in the Mac VM), which owns every folder
+permission decision. Nix symlinks may only resolve within the currently
+approved closure roots.
 """
 
 import errno
@@ -11,11 +13,12 @@ import os
 import posixpath
 import stat
 import threading
-from collections import Counter, OrderedDict
-from contextlib import contextmanager
+from collections import Counter
 from dataclasses import dataclass
 
 from fuse import FuseOSError, Operations
+
+from host_files import DenialLog, absolute as _absolute, attributes, virtual_attributes, within as _within
 
 
 STORE = "/nix/store"
@@ -23,18 +26,6 @@ _STORE_VIEW = "/store"
 _HOST_VIEW = "/host"
 _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _PATH = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
-_SYSTEM = ("/proc", "/sys", "/dev", "/run", "/nix")
-# Lookups of files that never exist, not user actions; Python's startup probes beside its executable included.
-_PROBES = {".DS_Store", ".directory", ".hidden", "desktop.ini", "autorun.inf", "pyvenv.cfg"}
-
-
-def _within(path, root):
-    return path == root or path.startswith(root.rstrip("/") + "/")
-
-
-def _absolute(path):
-    return (isinstance(path, str) and path.startswith("/") and "\0" not in path
-            and path == posixpath.normpath(path) and not path.startswith("//"))
 
 
 def _store_root(path):
@@ -42,30 +33,38 @@ def _store_root(path):
         return STORE + "/" + path[len(STORE) + 1:].split("/", 1)[0]
 
 
+def _host_target(path):
+    if _absolute(path) and _within(path, _HOST_VIEW):
+        return path[len(_HOST_VIEW):] or "/"
+    return None
+
+
 @dataclass(frozen=True)
 class _Entry:
     kind: str
     target: str = ""
-    anchor: str = "/"
-    writable: bool = False
 
 
 @dataclass
 class _Handle:
-    fd: int
-    path: str
+    fd: int = None
+    path: str = ""
+    host: object = None
+    sync: int = 0  # 0, or 1 for O_DSYNC / 2 for O_SYNC host handles
 
 
 class AccessFS(Operations):
-    """policy supplies snapshot(), deny(), and optional absolute private_paths.
+    """policy supplies snapshot() and deny() for programs and store roots.
 
     closure_resolver(program) returns absolute /nix/store/<root> closure roots.
     It must fail rather than return an incomplete closure. Results are cached;
     a fresh policy snapshot determines which cached closures remain accessible.
+    host_files implements the host_files.HostFiles interface for `/host`.
     """
 
-    def __init__(self, policy, base_store_roots, closure_resolver):
+    def __init__(self, policy, base_store_roots, closure_resolver, host_files):
         self.policy = policy
+        self.host_files = host_files
         self._requirements = base_store_roots
         self._base_roots = {key: frozenset(self._root(root) for root in item["roots"])
                             for key, item in base_store_roots.items()}
@@ -76,8 +75,7 @@ class AccessFS(Operations):
         self._handles = {}
         self._next_handle = 1
         self._lock = threading.RLock()
-        self._denials = OrderedDict()
-        self._history_generation = getattr(policy, "history_generation", 0)
+        self._denials = DenialLog(policy)
 
     @staticmethod
     def _root(path):
@@ -85,31 +83,18 @@ class AccessFS(Operations):
             raise ValueError("Expected an absolute Nix store root")
         return path
 
+    @staticmethod
+    def _host(call, *args, **kwargs):
+        """Host-files errors are ordinary OSError; present them as FUSE errors."""
+        try:
+            return call(*args, **kwargs)
+        except FuseOSError:
+            raise
+        except OSError as failure:
+            raise FuseOSError(failure.errno or errno.EIO) from None
+
     def _deny(self, kind, target, reason):
-        if posixpath.basename(target) in _PROBES or target.endswith("._pth"):
-            return
-        key = kind, target, reason
-        with self._lock:
-            generation = getattr(self.policy, "history_generation", 0)
-            if generation != self._history_generation:
-                self._denials.clear()
-                self._history_generation = generation
-            if key in self._denials:
-                return
-            self._denials[key] = None
-            if len(self._denials) > 256:
-                self._denials.popitem(last=False)
-        self.policy.deny(kind, target, reason)
-
-    def _blocked(self, path):
-        return any(_within(path, root) for root in (
-            *_SYSTEM, *getattr(self.policy, "private_paths", ())))
-
-    def _grants(self, snapshot):
-        return [(item["path"], bool(item.get("write")))
-                for item in snapshot.get("folders", ())
-                if isinstance(item, dict) and _absolute(item.get("path"))
-                and not self._blocked(item["path"])]
+        self._denials.record(kind, target, reason)
 
     def _blocked_roots(self, snapshot):
         return {self._root(root) for key in snapshot.get("disabled_requirements", ())
@@ -163,7 +148,8 @@ class AccessFS(Operations):
                 self._roots_key, self._approved_roots = key, roots
             return roots
 
-    def _entry(self, path, write=False, snapshot=None, file=False):
+    def _entry(self, path, write=False, snapshot=None):
+        """Entries outside `/host`; host paths are authorized by host_files."""
         if not _absolute(path):
             raise FuseOSError(errno.EINVAL)
         snapshot = self.policy.snapshot() if snapshot is None else snapshot
@@ -171,8 +157,6 @@ class AccessFS(Operations):
             if write:
                 raise FuseOSError(errno.EROFS)
             return _Entry("virtual")
-        if _within(path, _HOST_VIEW):
-            return self._host_entry(path[len(_HOST_VIEW):] or "/", write, snapshot, file)
         if path.startswith("/programs/"):
             name = path[len("/programs/"):]
             program = self._programs(snapshot).get(name)
@@ -187,23 +171,19 @@ class AccessFS(Operations):
             return self._store_entry(STORE + path[len(_STORE_VIEW):], write, snapshot)
         raise FuseOSError(errno.ENOENT)
 
-    def _host_entry(self, target, write, snapshot, file):
-        grants = self._grants(snapshot)
-        if not self._blocked(target):
-            matches = [(root, writable) for root, writable in grants
-                       if _within(target, root) and (writable or not write)]
-            if matches:
-                root, writable = max(matches, key=lambda item: len(item[0]))
-                return _Entry("host", target, root, writable)
-            if not write and (target == "/" or any(
-                    _within(root, target) for root, _ in grants)):
-                return _Entry("virtual")
-        self._deny("folder", posixpath.dirname(target) if file else target,
-                   "Folder is not granted for " + ("writing" if write else "reading"))
-        raise FuseOSError(errno.EACCES)
+    def _read_only(self, path):
+        """Mutations outside `/host` fail with the view's own error."""
+        self._entry(path, write=True)
+        raise FuseOSError(errno.EROFS)
 
     def _store_entry(self, target, write, snapshot):
-        if _store_root(target) not in self._roots(snapshot):
+        root = _store_root(target)
+        if root not in self._roots(snapshot):
+            # Node searches parent directories for optional package metadata; absence is not a denied grant.
+            try:
+                os.lstat(root)
+            except FileNotFoundError:
+                raise FuseOSError(errno.ENOENT) from None
             if "/bin/" in target and self._unapproved_executable(target):
                 self._deny("program", target, "Nix executable is not approved")
             raise FuseOSError(errno.EACCES)
@@ -237,82 +217,6 @@ class AccessFS(Operations):
         except BaseException:
             os.close(fd)
             raise
-
-    @contextmanager
-    def _parent(self, entry):
-        parent, name = posixpath.split(entry.target)
-        fd = self._directory(entry.anchor)
-        try:
-            device = os.fstat(fd).st_dev
-            relative = posixpath.relpath(parent, entry.anchor)
-            # The grant root itself is never a mutable directory entry.
-            if relative == ".." or relative.startswith("../"):
-                raise FuseOSError(errno.EACCES)
-            for part in relative.split("/") if relative != "." else ():
-                child = os.open(part, _PATH | os.O_DIRECTORY, dir_fd=fd)
-                if os.fstat(child).st_dev != device:
-                    os.close(child)
-                    raise FuseOSError(errno.EXDEV)
-                os.close(fd)
-                fd = child
-            yield fd, name, device
-        finally:
-            os.close(fd)
-
-    @staticmethod
-    def _safe_host(st, device):
-        if st.st_dev != device:
-            raise FuseOSError(errno.EXDEV)
-        if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
-            raise FuseOSError(errno.EACCES)
-        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
-            raise FuseOSError(errno.EACCES)
-
-    @staticmethod
-    def _reopen_host(inspected, flags):
-        if flags & os.O_CREAT and flags & os.O_EXCL:
-            raise FuseOSError(errno.EEXIST)
-        safe_flags = flags & ~(os.O_TRUNC | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
-        # This trusted proc link names the pinned, checked inode.
-        return os.open(f"/proc/self/fd/{inspected}", safe_flags
-                       | os.O_CLOEXEC | os.O_NONBLOCK)
-
-    def _host_open(self, entry, flags, mode=0o666):
-        if entry.target == entry.anchor:
-            pinned = self._directory(entry.anchor)
-            if flags == _PATH:
-                return pinned
-            try:
-                return self._reopen_host(pinned, flags)
-            finally:
-                os.close(pinned)
-        with self._parent(entry) as (parent, name, device):
-            # Pin the inode before opening it: a replaced device must never open.
-            try:
-                inspected = os.open(name, _PATH, dir_fd=parent)
-            except FileNotFoundError:
-                if not flags & os.O_CREAT:
-                    raise
-                fd = os.open(name, flags | os.O_EXCL | os.O_NOFOLLOW
-                             | os.O_CLOEXEC, mode, dir_fd=parent)
-            else:
-                try:
-                    self._safe_host(os.fstat(inspected), device)
-                    if flags == _PATH:
-                        fd, inspected = inspected, None
-                    else:
-                        fd = self._reopen_host(inspected, flags)
-                finally:
-                    if inspected is not None:
-                        os.close(inspected)
-            try:
-                self._safe_host(os.fstat(fd), device)
-                if flags & os.O_TRUNC:
-                    os.ftruncate(fd, 0)
-                return fd
-            except BaseException:
-                os.close(fd)
-                raise
 
     @staticmethod
     def _checked_store_link(fd, final, follow_final, links):
@@ -359,8 +263,6 @@ class AccessFS(Operations):
                 os.close(fd)
 
     def _open_entry(self, entry, flags):
-        if entry.kind == "host":
-            return self._host_open(entry, flags)
         if entry.kind in ("store", "program"):
             target = self._store_resolve(entry.target, self._roots(self.policy.snapshot()))
             parent = self._directory(posixpath.dirname(target))
@@ -383,45 +285,31 @@ class AccessFS(Operations):
                 os.close(parent)
         raise FuseOSError(errno.EISDIR)
 
-    @staticmethod
-    def _attributes(st, writable=False):
-        if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)
-                or stat.S_ISLNK(st.st_mode)):
-            raise FuseOSError(errno.EACCES)
-        attrs = {key: getattr(st, key) for key in (
-            "st_mode", "st_nlink", "st_size", "st_atime", "st_mtime", "st_ctime",
-            "st_uid", "st_gid", "st_ino")}
-        attrs["st_mode"] &= ~0o6000  # Never advertise host set-id privileges.
-        if not writable:
-            attrs["st_mode"] &= ~0o222
-        return attrs
-
     def getattr(self, path, fh=None):
+        target = _host_target(path)
+        if target is not None:
+            return self._host(self.host_files.getattr, target)
         entry = self._entry(path)
         if entry.kind == "virtual":
-            return {"st_mode": stat.S_IFDIR | 0o555, "st_nlink": 2,
-                    "st_uid": os.getuid(), "st_gid": os.getgid(), "st_size": 0}
+            return virtual_attributes()
         if entry.kind == "program":
             return {"st_mode": stat.S_IFLNK | 0o777, "st_nlink": 1,
                     "st_uid": os.getuid(), "st_gid": os.getgid(),
                     "st_size": len(entry.target)}
-        if entry.kind == "store":
-            roots = self._roots(self.policy.snapshot())
-            target = self._store_resolve(entry.target, roots, follow_final=False)
-            self._store_resolve(entry.target, roots)
-            parent = self._directory(posixpath.dirname(target))
-            try:
-                return self._attributes(os.stat(posixpath.basename(target),
-                                                dir_fd=parent, follow_symlinks=False))
-            finally:
-                os.close(parent)
-        fd = self._host_open(entry, _PATH)
+        roots = self._roots(self.policy.snapshot())
+        target = self._store_resolve(entry.target, roots, follow_final=False)
+        self._store_resolve(entry.target, roots)
+        parent = self._directory(posixpath.dirname(target))
         try:
-            return self._attributes(os.fstat(fd), entry.writable)
+            return attributes(os.stat(posixpath.basename(target),
+                                      dir_fd=parent, follow_symlinks=False))
         finally:
-            os.close(fd)
+            os.close(parent)
 
     def readdir(self, path, fh):
+        target = _host_target(path)
+        if target is not None:
+            return [".", "..", *self._host(self.host_files.readdir, target)]
         snapshot = self.policy.snapshot()
         entry = self._entry(path, snapshot=snapshot)
         if path == "/":
@@ -430,11 +318,6 @@ class AccessFS(Operations):
             names = {posixpath.basename(root) for root in self._roots(snapshot)}
         elif path == "/programs":
             names = set(self._programs(snapshot))
-        elif entry.kind == "virtual":
-            target = path[len(_HOST_VIEW):] or "/"
-            names = {posixpath.relpath(root, target).split("/")[0]
-                     for root, _ in self._grants(snapshot) if _within(root, target)
-                     and root != target}
         else:
             fd = self._open_entry(entry, _DIRECTORY)
             try:
@@ -443,9 +326,6 @@ class AccessFS(Operations):
                 os.close(fd)
         visible = []
         for name in sorted(names):
-            if entry.kind == "host" and self._blocked(
-                    posixpath.join(entry.target, name)):
-                continue
             try:
                 self.getattr(path.rstrip("/") + "/" + name)
             except OSError:
@@ -454,6 +334,8 @@ class AccessFS(Operations):
         return [".", "..", *visible]
 
     def readlink(self, path):
+        if _host_target(path) is not None:
+            raise FuseOSError(errno.EACCES)
         entry = self._entry(path)
         if entry.kind == "program":
             return entry.target
@@ -470,189 +352,213 @@ class AccessFS(Operations):
             os.close(parent)
         return self._store_resolve(entry.target, self._roots(self.policy.snapshot()))
 
-    def _register(self, path, fd, fi):
+    def _register(self, path, record, fi):
         with self._lock:
             handle = self._next_handle
             self._next_handle += 1
             if fi is not None:
                 fi.fh = handle
-                host = _within(path, _HOST_VIEW)
+                host = record.host is not None
                 fi.direct_io = int(host)
                 # Store files are immutable; every open is still authorized, only their page cache survives.
                 fi.keep_cache = int(not host)
-            self._handles[handle] = _Handle(fd, path)
+            self._handles[handle] = record
         return handle if fi is None else 0
+
+    @staticmethod
+    def _sync_mode(flags):
+        if flags & os.O_SYNC == os.O_SYNC:
+            return 2
+        return 1 if flags & os.O_DSYNC else 0
+
+    def _register_host(self, path, handle, flags, fi):
+        try:
+            return self._register(path, _Handle(path=path, host=handle,
+                                                sync=self._sync_mode(flags)), fi)
+        except BaseException:
+            self.host_files.close(handle)
+            raise
 
     def open(self, path, flags):
         fi = None if isinstance(flags, int) else flags
         flags = flags if fi is None else fi.flags
+        target = _host_target(path)
+        if target is not None:
+            access = flags & os.O_ACCMODE
+            handle = self._host(
+                self.host_files.open, target,
+                read=access in (os.O_RDONLY, os.O_RDWR),
+                write=access in (os.O_WRONLY, os.O_RDWR),
+                append=bool(flags & os.O_APPEND), truncate=bool(flags & os.O_TRUNC))
+            return self._register_host(path, handle, flags, fi)
         write = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_TRUNC | os.O_APPEND))
         with self._lock:
-            entry = self._entry(path, write=write, file=True)
-            try:
-                fd = self._open_entry(entry, flags)
-            except OSError:
-                if entry.kind == "host":
-                    self._deny("folder", posixpath.dirname(entry.target),
-                               "Host path is unsafe or unavailable")
-                raise
+            entry = self._entry(path, write=write)
+            fd = self._open_entry(entry, flags)
             try:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise FuseOSError(errno.EISDIR)
-                return self._register(path, fd, fi)
+                return self._register(path, _Handle(fd, path), fi)
             except BaseException:
                 os.close(fd)
                 raise
 
     def create(self, path, mode, fi=None):
-        with self._lock:
+        target = _host_target(path)
+        if target is None:
             self._entry(posixpath.dirname(path), write=True)
-            entry = self._entry(path, write=True, file=True)
-            flags = os.O_RDWR if fi is None else fi.flags
-            fd = self._host_open(entry, flags | os.O_CREAT | os.O_EXCL, mode & 0o777)
-            try:
-                return self._register(path, fd, fi)
-            except BaseException:
-                os.close(fd)
-                raise
+            self._read_only(path)
+        flags = os.O_RDWR if fi is None else fi.flags
+        access = flags & os.O_ACCMODE
+        handle = self._host(
+            self.host_files.create, target, mode & 0o777,
+            read=access in (os.O_RDONLY, os.O_RDWR),
+            write=access in (os.O_WRONLY, os.O_RDWR),
+            append=bool(flags & os.O_APPEND), exclusive=True)
+        return self._register_host(path, handle, flags, fi)
 
-    @contextmanager
-    def _handle(self, fh, write=False):
+    def _lookup(self, fh):
         fh = fh if isinstance(fh, int) else fh.fh
-        fd = None
-        try:
-            with self._lock:
-                handle = self._handles.get(fh)
-                if handle is None:
-                    raise FuseOSError(errno.EBADF)
-                fd, path = os.dup(handle.fd), handle.path
-                entry = self._entry(path, write=write, file=True)
-                current = self._open_entry(entry, _PATH)
-                try:
-                    actual, now = os.fstat(fd), os.fstat(current)
-                    if (actual.st_dev, actual.st_ino) != (now.st_dev, now.st_ino):
-                        raise FuseOSError(errno.EACCES)
-                    if entry.kind == "host":
-                        self._safe_host(actual, now.st_dev)
-                finally:
-                    os.close(current)
-            yield fd
-        finally:
-            if fd is not None:
-                os.close(fd)
+        with self._lock:
+            record = self._handles.get(fh)
+        if record is None:
+            raise FuseOSError(errno.EBADF)
+        return record
 
-    def read(self, path, size, offset, fh):
-        with self._handle(fh) as fd:
-            return os.pread(fd, size, offset)
+    def _store_handle(self, record, write=False):
+        """A duplicate of a store handle's descriptor, revalidated against current roots."""
+        fd = os.dup(record.fd)
+        try:
+            entry = self._entry(record.path, write=write)
+            current = self._open_entry(entry, _PATH)
+            try:
+                actual, now = os.fstat(fd), os.fstat(current)
+                if (actual.st_dev, actual.st_ino) != (now.st_dev, now.st_ino):
+                    raise FuseOSError(errno.EACCES)
+            finally:
+                os.close(current)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _store_write(self, record):
+        """Store handles are immutable: report the view's own error for any mutation."""
+        os.close(self._store_handle(record, write=True))
+        raise FuseOSError(errno.EROFS)
 
     def write(self, path, data, offset, fh):
-        with self._handle(fh, write=True) as fd:
-            return os.pwrite(fd, data, offset)
+        record = self._lookup(fh)
+        if record.host is None:
+            self._store_write(record)
+        written = self._host(self.host_files.write, record.host, data, offset)
+        if record.sync:
+            self._host(self.host_files.fsync, record.host, record.sync == 1)
+        return written
 
     def truncate(self, path, length, fh=None):
         if fh is not None:
-            with self._handle(fh, write=True) as fd:
-                os.ftruncate(fd, length)
-        else:
-            fd = self._open_entry(self._entry(path, write=True, file=True), os.O_WRONLY)
-            try:
-                os.ftruncate(fd, length)
-            finally:
-                os.close(fd)
+            record = self._lookup(fh)
+            if record.host is None:
+                self._store_write(record)
+            self._host(self.host_files.truncate, None, length, record.host)
+            return 0
+        target = _host_target(path)
+        if target is None:
+            self._read_only(path)
+        self._host(self.host_files.truncate, target, length)
         return 0
 
+    def read(self, path, size, offset, fh):
+        record = self._lookup(fh)
+        if record.host is not None:
+            return self._host(self.host_files.read, record.host, size, offset)
+        fd = self._store_handle(record)
+        try:
+            return os.pread(fd, size, offset)
+        finally:
+            os.close(fd)
+
     def flush(self, path, fh):
-        fh = fh if isinstance(fh, int) else fh.fh
-        with self._lock:
-            if fh not in self._handles:
-                raise FuseOSError(errno.EBADF)
+        record = self._lookup(fh)
+        if record.host is not None:
+            self._host(self.host_files.flush, record.host)
         return 0
 
     def fsync(self, path, datasync, fh):
-        with self._handle(fh) as fd:
+        record = self._lookup(fh)
+        if record.host is not None:
+            self._host(self.host_files.fsync, record.host, bool(datasync))
+            return 0
+        fd = self._store_handle(record)
+        try:
             (os.fdatasync if datasync else os.fsync)(fd)
+        finally:
+            os.close(fd)
         return 0
 
     def release(self, path, fh):
         fh = fh if isinstance(fh, int) else fh.fh
         with self._lock:
-            handle = self._handles.pop(fh, None)
-        if handle is not None:
-            os.close(handle.fd)
+            record = self._handles.pop(fh, None)
+        if record is None:
+            return 0
+        if record.host is not None:
+            try:
+                self.host_files.close(record.host)
+            except OSError:
+                pass  # The handle is already gone (closed transport or unknown).
+        else:
+            os.close(record.fd)
         return 0
 
-    def _mutable_parent(self, path):
-        self._entry(posixpath.dirname(path), write=True)
-        entry = self._entry(path, write=True)
-        if entry.kind != "host":
-            raise FuseOSError(errno.EROFS)
-        if any(_within(private, entry.target)
-               for private in getattr(self.policy, "private_paths", ())):
-            raise FuseOSError(errno.EACCES)
-        return entry
+    def _host_mutation(self, path):
+        target = _host_target(path)
+        if target is None:
+            self._entry(posixpath.dirname(path), write=True)
+            self._read_only(path)
+        return target
 
     def mkdir(self, path, mode):
-        entry = self._mutable_parent(path)
-        with self._parent(entry) as (parent, name, _):
-            os.mkdir(name, mode & 0o777, dir_fd=parent)
-        return 0
-
-    def _remove(self, path, directory):
-        entry = self._mutable_parent(path)
-        checked = self._host_open(entry, _PATH)
-        try:
-            with self._parent(entry) as (parent, name, _):
-                (os.rmdir if directory else os.unlink)(name, dir_fd=parent)
-        finally:
-            os.close(checked)
+        self._host(self.host_files.mkdir, self._host_mutation(path), mode & 0o777)
         return 0
 
     def unlink(self, path):
-        return self._remove(path, False)
+        self._host(self.host_files.unlink, self._host_mutation(path))
+        return 0
 
     def rmdir(self, path):
-        return self._remove(path, True)
+        self._host(self.host_files.rmdir, self._host_mutation(path))
+        return 0
 
     def rename(self, old, new):
-        with self._lock:
-            source, destination = self._mutable_parent(old), self._mutable_parent(new)
-            checked = self._host_open(source, _PATH)
-            try:
-                try:
-                    existing = self._host_open(destination, _PATH)
-                except FileNotFoundError:
-                    pass
-                else:
-                    os.close(existing)
-                with self._parent(source) as (src, src_name, _):
-                    with self._parent(destination) as (dst, dst_name, _):
-                        os.rename(src_name, dst_name, src_dir_fd=src, dst_dir_fd=dst)
-                for handle in self._handles.values():
-                    if _within(handle.path, old):
-                        handle.path = new + handle.path[len(old):]
-            finally:
-                os.close(checked)
+        source, destination = _host_target(old), _host_target(new)
+        for path, target in ((old, source), (new, destination)):
+            if target is None:
+                self._host_mutation(path)
+        self._host(self.host_files.rename, source, destination)
         return 0
 
     def chmod(self, path, mode):
-        entry = self._entry(path, write=True)
-        fd = self._open_entry(entry, _PATH)
-        try:
-            os.chmod(f"/proc/self/fd/{fd}", mode & 0o777)
-        finally:
-            os.close(fd)
+        target = _host_target(path)
+        if target is None:
+            self._read_only(path)
+        self._host(self.host_files.chmod, target, mode & 0o777)
         return 0
 
     def utimens(self, path, times=None):
-        entry = self._entry(path, write=True)
-        fd = self._open_entry(entry, _PATH)
-        try:
-            os.utime(f"/proc/self/fd/{fd}", times)
-        finally:
-            os.close(fd)
+        target = _host_target(path)
+        if target is None:
+            self._read_only(path)
+        self._host(self.host_files.utimens, target, times)
         return 0
 
     def access(self, path, mode):
+        target = _host_target(path)
+        if target is not None:
+            self._host(self.host_files.access, target, read=bool(mode & os.R_OK),
+                       write=bool(mode & os.W_OK), execute=bool(mode & os.X_OK))
+            return 0
         entry = self._entry(path, write=bool(mode & os.W_OK))
         attrs = self.getattr(path)
         if mode & os.X_OK and not attrs["st_mode"] & 0o111:
@@ -662,6 +568,9 @@ class AccessFS(Operations):
         return 0
 
     def statfs(self, path):
+        target = _host_target(path)
+        if target is not None:
+            return self._host(self.host_files.statfs, target)
         entry = self._entry(path)
         if entry.kind == "virtual":
             return {"f_bsize": 4096, "f_frsize": 4096, "f_blocks": 0,
@@ -689,7 +598,14 @@ class AccessFS(Operations):
         raise FuseOSError(errno.EPERM)
 
     def destroy(self, path):
+        """Close every handle this view opened; host_files' own lifetime belongs to its owner."""
         with self._lock:
             handles, self._handles = self._handles, {}
-        for handle in handles.values():
-            os.close(handle.fd)
+        for record in handles.values():
+            if record.host is not None:
+                try:
+                    self.host_files.close(record.host)
+                except OSError:
+                    pass
+            else:
+                os.close(record.fd)

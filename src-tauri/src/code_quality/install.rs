@@ -75,6 +75,10 @@ pub(crate) fn podman_connections(control: &RunControl) -> Result<Vec<Value>> {
     let program = runtime::podman_program().ok_or(
         "Podman is not installed. Choose Install runtime (https://podman.io/docs/installation).",
     )?;
+    connection_list(&program, control)
+}
+
+fn connection_list(program: &Path, control: &RunControl) -> Result<Vec<Value>> {
     let mut cmd = Command::new(program);
     cmd.args(["system", "connection", "list", "--format", "json"]);
     let out = runtime::run_bounded(cmd, None, PROBE_TIMEOUT, control)?;
@@ -83,17 +87,22 @@ pub(crate) fn podman_connections(control: &RunControl) -> Result<Vec<Value>> {
         .map_err(|_| "Invalid or oversized Podman connection list.".into())
 }
 
-fn machines(control: &RunControl) -> Result<Vec<Value>> {
-    let mut cmd = Command::new(runtime::podman_program().ok_or("Podman is not installed.")?);
+#[cfg(windows)]
+fn podman() -> Result<PathBuf> {
+    runtime::podman_program().ok_or_else(|| "Podman is not installed.".to_string())
+}
+
+fn machines(program: &Path, control: &RunControl) -> Result<Vec<Value>> {
+    let mut cmd = Command::new(program);
     cmd.args(["machine", "list", "--format", "json"]);
     let out = runtime::run_bounded(cmd, None, PROBE_TIMEOUT, control)?;
     out.require_success("List Podman machines")?;
     serde_json::from_slice(&out.stdout).map_err(|_| "Invalid Podman machine list.".into())
 }
 
-fn inspect_machine(name: &str, control: &RunControl) -> Result<Value> {
+fn inspect_machine(program: &Path, name: &str, control: &RunControl) -> Result<Value> {
     runtime::validate_selector(name, "Podman machine")?;
-    let mut cmd = Command::new(runtime::podman_program().ok_or("Podman is not installed.")?);
+    let mut cmd = Command::new(program);
     cmd.args(["machine", "inspect", name]);
     let out = runtime::run_bounded(cmd, None, PROBE_TIMEOUT, control)?;
     out.require_success("Inspect selected Podman machine")?;
@@ -106,46 +115,87 @@ fn inspect_machine(name: &str, control: &RunControl) -> Result<Value> {
         .ok_or("Podman machine inspection was empty.".into())
 }
 
-fn connection_machine(
-    connection: &Value,
-    candidates: &[Value],
-    control: &RunControl,
-) -> Option<String> {
-    let uri = Url::parse(connection["URI"].as_str()?).ok()?;
-    if uri.scheme() != "ssh"
-        || !matches!(
-            uri.host_str(),
-            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
-        )
-    {
-        return None;
-    }
-    let port = u64::from(uri.port()?);
-    let identity = connection["Identity"].as_str()?;
-    for item in candidates {
-        let Some(name) = item["Name"].as_str() else {
-            continue;
-        };
-        let Ok(machine) = inspect_machine(name, control) else {
-            continue;
-        };
-        if machine.pointer("/SSHConfig/Port").and_then(|v| v.as_u64()) == Some(port)
-            && machine
-                .pointer("/SSHConfig/IdentityPath")
-                .and_then(|v| v.as_str())
-                == Some(identity)
-        {
-            return Some(name.into());
-        }
-    }
-    None
+/// A Podman connection proven, by its live loopback SSH endpoint, user and canonical identity
+/// file, to address exactly one local machine. Connection and machine names are never authority.
+#[cfg(any(windows, target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MachineBinding {
+    pub name: String,
+    /// The live `Created` value: a rebuilt machine reusing the name has a different identity.
+    pub created: String,
+    pub running: bool,
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PodmanTarget {
+    Machine(MachineBinding),
+    /// An explicitly selected connection that addresses no local machine (a remote engine): it
+    /// may serve ordinary engine operations, but its VM limits are unknown and never changed.
+    Remote,
+}
+
+/// Resolves the selected connection (empty: the configured default) from
+/// `podman system connection list` and binds it to the one machine whose live inspection matches
+/// its endpoint. An explicit selection never falls back to another connection or machine.
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn podman_target(
+    program: &Path,
+    selected: &str,
+    control: &RunControl,
+) -> Result<PodmanTarget> {
+    let entries = connection_list(program, control)?;
+    let entry = if selected.is_empty() {
+        entries.iter().find(|entry| entry["Default"].as_bool() == Some(true)).ok_or(
+            "No default Podman connection is configured. Create and start a Podman machine yourself (for example `podman machine init --now`), or select an existing connection explicitly, then Recheck. OMP Manager does not create machines on macOS.",
+        )?
+    } else {
+        runtime::validate_selector(selected, "Podman connection")?;
+        entries
+            .iter()
+            .find(|entry| entry["Name"].as_str() == Some(selected))
+            .ok_or_else(|| format!("Podman connection '{selected}' is not configured. Recheck and choose an existing connection; no other connection or machine is used instead."))?
+    };
+    let mut matched = Vec::new();
+    for listed in machines(program, control)? {
+        // JSON names are plain; the table format's default marker is tolerated defensively.
+        let Some(name) = listed["Name"]
+            .as_str()
+            .map(|name| name.trim_end_matches('*'))
+        else {
+            continue;
+        };
+        let machine = inspect_machine(program, name, control)?;
+        if machine["Name"].as_str() == Some(name)
+            && machine_store_is_rootful(entry, &machine).is_some()
+        {
+            matched.push(machine);
+        }
+    }
+    let label = entry["Name"].as_str().unwrap_or_default();
+    match matched.as_slice() {
+        [machine] => Ok(PodmanTarget::Machine(MachineBinding {
+            name: machine["Name"].as_str().unwrap_or_default().to_owned(),
+            created: machine["Created"]
+                .as_str()
+                .filter(|created| !created.trim().is_empty())
+                .ok_or("Podman omitted the machine's creation identity; its connection association cannot be verified.")?
+                .to_owned(),
+            running: machine["State"].as_str() == Some("running"),
+        })),
+        [] if selected.is_empty() => Err(format!("The default Podman connection '{label}' does not address an existing local Podman machine. Create and start one yourself (for example `podman machine init --now`), or select a connection explicitly, then Recheck.")),
+        [] => Ok(PodmanTarget::Remote),
+        _ => Err(format!("Several Podman machines match the endpoint of connection '{label}'. The association is ambiguous, so no machine is used; repair the Podman machine configuration and Recheck.")),
+    }
+}
+
+/// The machine behind the Windows Podman selection (empty: the app-owned machine's connection).
+#[cfg(windows)]
 pub(crate) fn podman_machine_for_connection(
     config_root: &Path,
     runtime: &QualityRuntime,
     control: &RunControl,
-) -> Option<String> {
+) -> Option<MachineBinding> {
     let QualityRuntime::Podman { connection } = runtime else {
         return None;
     };
@@ -154,17 +204,10 @@ pub(crate) fn podman_machine_for_connection(
     } else {
         connection.clone()
     };
-    let entries = podman_connections(control).ok()?;
-    let entry = entries
-        .iter()
-        .find(|c| c["Name"].as_str() == Some(connection.as_str()))?;
-    connection_machine(entry, &machines(control).ok()?, control)
-}
-
-pub(crate) fn podman_machine_identity(machine: &str, control: &RunControl) -> Option<String> {
-    inspect_machine(machine, control).ok()?["Created"]
-        .as_str()
-        .map(str::to_owned)
+    match podman_target(&runtime::podman_program()?, &connection, control).ok()? {
+        PodmanTarget::Machine(machine) => Some(machine),
+        PodmanTarget::Remote => None,
+    }
 }
 
 const EXTERNAL_MACHINE_STOP: &str = "Code quality containers stopped; this Podman machine is not owned by OMP Manager and was left running.";
@@ -187,26 +230,27 @@ fn verified_stop_identity<'a>(receipt: &'a PodmanReceipt, machine: &Value) -> Re
     Ok(created)
 }
 
-// Connection names are not authority: match the loopback SSH endpoint and identity
-// recorded by the live machine inspection, then distinguish both container stores.
+// Connection names are not authority: match the loopback SSH endpoint, user and canonical
+// identity file recorded by the live machine inspection, then distinguish both container stores.
 fn machine_store_is_rootful(connection: &Value, machine: &Value) -> Option<bool> {
     let uri = Url::parse(connection["URI"].as_str()?).ok()?;
     let port = machine.pointer("/SSHConfig/Port")?.as_u64()?;
     let identity = machine.pointer("/SSHConfig/IdentityPath")?.as_str()?;
-    if identity.is_empty()
+    let user = machine.pointer("/SSHConfig/RemoteUsername")?.as_str()?;
+    if user.is_empty()
         || uri.scheme() != "ssh"
         || !matches!(
             uri.host_str(),
             Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
         )
         || uri.port().map(u64::from) != Some(port)
-        || connection["Identity"].as_str() != Some(identity)
+        || !same_identity_file(connection["Identity"].as_str()?, identity)
     {
         return None;
     }
     if uri.username() == "root" && uri.path() == "/run/podman/podman.sock" {
         Some(true)
-    } else if !uri.username().is_empty() && uri.username() != "root" {
+    } else if uri.username() == user && user != "root" {
         let uid = uri
             .path()
             .strip_prefix("/run/user/")?
@@ -219,6 +263,17 @@ fn machine_store_is_rootful(connection: &Value, machine: &Value) -> Option<bool>
     } else {
         None
     }
+}
+
+/// Both paths name the same existing file after canonicalization (an unresolvable path never matches).
+fn same_identity_file(connection: &str, machine: &str) -> bool {
+    if connection.is_empty() || machine.is_empty() {
+        return false;
+    }
+    matches!(
+        (fs::canonicalize(connection), fs::canonicalize(machine)),
+        (Ok(a), Ok(b)) if a == b
+    )
 }
 
 fn shutdown_store_connections<'a>(
@@ -338,17 +393,21 @@ fn remaining_store_containers(
 
 #[cfg(windows)]
 fn stop_verified_machine(receipt: &PodmanReceipt, control: &RunControl) -> Result<()> {
-    verified_stop_identity(receipt, &inspect_machine(&receipt.machine, control)?)?;
+    let program = podman()?;
+    verified_stop_identity(
+        receipt,
+        &inspect_machine(&program, &receipt.machine, control)?,
+    )?;
     if control.cancelled() {
         return Err("Podman server shutdown was cancelled; the machine was left running.".into());
     }
-    let mut cmd = Command::new(runtime::podman_program().ok_or("Podman is not installed.")?);
+    let mut cmd = Command::new(&program);
     cmd.args(["machine", "stop", &receipt.machine]);
     runtime::run_machine(cmd, Duration::from_secs(180), control)?
         .require_success("Stop app-owned Podman machine")?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let current = inspect_machine(&receipt.machine, control)?;
+        let current = inspect_machine(&program, &receipt.machine, control)?;
         verified_stop_identity(receipt, &current)?;
         if current["State"].as_str() == Some("stopped") {
             return Ok(());
@@ -382,7 +441,7 @@ pub fn stop_owned_podman_machine(
     }
     let selected = selected_stop_connection(&receipt, connection)?;
     runtime::validate_selector(selected, "Podman connection")?;
-    let machine = inspect_machine(&receipt.machine, control)?;
+    let machine = inspect_machine(&podman()?, &receipt.machine, control)?;
     verified_stop_identity(&receipt, &machine)?;
     let entries = podman_connections(control)?;
     // A stopped machine needs no store probes (which would require starting it),
@@ -819,65 +878,44 @@ fn record_podman_setup_identity(
     save_receipt(root, receipt)
 }
 
-fn setup_rootless_connection<'a>(value: &'a Value, port: u64, identity: &str) -> Option<&'a str> {
-    let uri = Url::parse(value["URI"].as_str()?).ok()?;
-    let rootless = uri.path().starts_with("/run/user/") && uri.username() != "root";
-    if rootless
-        && uri.port().map(u64::from) == Some(port)
-        && value["Identity"].as_str() == Some(identity)
-        && matches!(
-            uri.host_str(),
-            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
-        )
-    {
-        value["Name"].as_str()
-    } else {
-        None
-    }
-}
-
 fn setup_podman(root: &Path, control: &RunControl) -> Result<String> {
+    let program = runtime::podman_program().ok_or(
+        "Podman was not found after installation. Recheck or repair the official installation.",
+    )?;
     let receipt = read_receipt(root)?;
-    let existing = machines(control)?
+    let existing = machines(&program, control)?
         .iter()
         .any(|v| v["Name"].as_str() == Some(MACHINE));
     let mut receipt = prepare_podman_receipt(root, receipt, existing)?;
     if !existing {
-        let mut cmd = Command::new(runtime::podman_program().ok_or(
-            "Podman was not found after installation. Recheck or repair the official installation.",
-        )?);
+        let mut cmd = Command::new(&program);
         // Podman 5.8 has no --provider/--update-connection flags: the provider is chosen by this variable.
         cmd.env("CONTAINERS_MACHINE_PROVIDER", "wsl");
         cmd.args(["machine", "init", "--rootful=false", MACHINE]);
         crate::code_quality::runtime::run_machine(cmd, Duration::from_secs(30 * 60), control)?
             .require_success("Initialize app-owned WSL Podman machine")?;
     }
-    if !machines(control)?
+    if !machines(&program, control)?
         .iter()
         .any(|v| v["Name"].as_str() == Some(MACHINE) && v["VMType"].as_str() == Some("wsl"))
     {
         return Err("The app-owned Podman machine is not verified as WSL-backed. It will not be adopted or reconfigured; choose an existing connection explicitly.".into());
     }
-    let inspected = inspect_machine(MACHINE, control)?;
+    let inspected = inspect_machine(&program, MACHINE, control)?;
     record_podman_setup_identity(root, &mut receipt, &inspected)?;
     if inspected["State"].as_str() != Some("running") {
-        let mut cmd = Command::new(runtime::podman_program().ok_or("Podman is not installed.")?);
+        let mut cmd = Command::new(&program);
         cmd.args(["machine", "start", MACHINE]);
         crate::code_quality::runtime::run_machine(cmd, Duration::from_secs(10 * 60), control)?
             .require_success("Start app-owned Podman machine")?;
     }
-    let inspected = inspect_machine(MACHINE, control)?;
-    let port = inspected
-        .pointer("/SSHConfig/Port")
-        .and_then(|v| v.as_u64())
-        .ok_or("Podman machine omitted its SSH port.")?;
-    let identity = inspected
-        .pointer("/SSHConfig/IdentityPath")
-        .and_then(|v| v.as_str())
-        .ok_or("Podman machine omitted its SSH identity path.")?;
-    let connections = podman_connections(control)?;
-    let connection = connections.iter().find_map(|value| setup_rootless_connection(value, port, identity))
-        .map(str::to_owned).ok_or("The app-owned Podman machine has no verified rootless connection. Repair Podman machine setup, then retry; no ambient/default connection will be used.")?;
+    let inspected = inspect_machine(&program, MACHINE, control)?;
+    let connection = connection_list(&program, control)?
+        .iter()
+        .find(|value| machine_store_is_rootful(value, &inspected) == Some(false))
+        .and_then(|value| value["Name"].as_str())
+        .map(str::to_owned)
+        .ok_or("The app-owned Podman machine has no verified rootless connection. Repair Podman machine setup, then retry; no ambient/default connection will be used.")?;
     receipt.connection = Some(connection.clone());
     receipt.stage = "ready".into();
     save_receipt(root, &receipt)?;
@@ -1084,7 +1122,7 @@ pub fn raise_vm_limits_at(
             let machine = podman_machine_for_connection(config_root, engine.runtime(), control)
                 .ok_or("Cannot raise limits on an unverified remote Podman VM. Ask its administrator to set vm.max_map_count>=524288 and fs.file-max>=131072, then Recheck.")?;
             let mut cmd = Command::new(runtime::podman_program().ok_or("Podman is not installed.")?);
-            cmd.args(["machine", "ssh", &machine, "sudo", "-n", "/bin/sh", "-s"]);
+            cmd.args(["machine", "ssh", &machine.name, "sudo", "-n", "/bin/sh", "-s"]);
             cmd
         }
         QualityRuntime::DockerDesktop => return Err("Docker Desktop does not expose a supported VM sysctl setup API to this app. Follow Docker Desktop's supported Linux VM configuration instructions to set vm.max_map_count>=524288 and fs.file-max>=131072, then Recheck. OMP Manager will not use a privileged container or disable Elasticsearch bootstrap checks.".into()),
@@ -1174,15 +1212,26 @@ mod tests {
         }
     }
 
+    /// A real identity file: endpoint matching compares canonical paths of existing files.
+    fn stop_identity() -> &'static str {
+        static IDENTITY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            let path =
+                std::env::temp_dir().join(format!("omp-quality-identity-{}", Uuid::new_v4()));
+            fs::write(&path, "fixture key").unwrap();
+            path.to_string_lossy().into_owned()
+        });
+        &IDENTITY
+    }
+
     fn stop_machine() -> Value {
         serde_json::json!({ "Name": MACHINE, "Created": "2026-10-17T12:00:00Z", "State": "running",
-            "SSHConfig": { "Port": 54321, "IdentityPath": "C:/quality/identity" } })
+            "SSHConfig": { "Port": 54321, "IdentityPath": stop_identity(), "RemoteUsername": "user" } })
     }
 
     fn stop_connections() -> Vec<Value> {
         vec![
-            serde_json::json!({ "Name": "quality-user", "URI": "ssh://user@127.0.0.1:54321/run/user/1000/podman/podman.sock", "Identity": "C:/quality/identity" }),
-            serde_json::json!({ "Name": "quality-root", "URI": "ssh://root@127.0.0.1:54321/run/podman/podman.sock", "Identity": "C:/quality/identity" }),
+            serde_json::json!({ "Name": "quality-user", "URI": "ssh://user@127.0.0.1:54321/run/user/1000/podman/podman.sock", "Identity": stop_identity() }),
+            serde_json::json!({ "Name": "quality-root", "URI": "ssh://root@127.0.0.1:54321/run/podman/podman.sock", "Identity": stop_identity() }),
         ]
     }
 
@@ -1248,6 +1297,7 @@ mod tests {
         let original = stop_connections().remove(0);
         for uri in [
             "ssh://user@remote.example:54321/run/user/1000/podman/podman.sock",
+            "ssh://admin@127.0.0.1:54321/run/user/1000/podman/podman.sock",
             "ssh://user@127.0.0.1:12345/run/user/1000/podman/podman.sock",
             "http://127.0.0.1:54321/run/user/1000/podman/podman.sock",
             "ssh://root@127.0.0.1:54321/run/user/1000/podman/podman.sock",

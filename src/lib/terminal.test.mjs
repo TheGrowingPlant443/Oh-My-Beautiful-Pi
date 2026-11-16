@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { terminalTabs, nextSelection, outputWrite, stripAnsi, shellKey, commandKey, HISTORY_KEY, DECISIONS_KEY, MONITOR_KEY, registerBackendReplies, isReplayReply } from './terminal.ts';
+import { terminalTabs, nextSelection, outputWrite, stripAnsi, shellKey, commandKey, HISTORY_KEY, DECISIONS_KEY, MONITOR_KEY, registerBackendReplies, isReplayReply, createTerminalQueue } from './terminal.ts';
 import xterm from '@xterm/xterm';
 
 function command(id, tab, startedAt, description = null) {
@@ -120,4 +120,51 @@ test('initial replay filters only view-owned replies, never DA1 or cursor-shaped
   for (const reply of ['\x1b[>0;276;0c', '\x1b[0n', '\x1b]10;rgb:0000/0000/0000\x1b\\']) {
     assert.equal(isReplayReply(reply), true);
   }
+});
+
+test('terminal IPC preserves all input and lifecycle order while another terminal remains independent', async () => {
+  const queue = createTerminalQueue();
+  const calls = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const first = queue('pty:a', async () => { calls.push('attach'); await gate; });
+  const input = ['echo ', 'café', '\x1b[1;2R', '\n'];
+  const writes = input.map(data => queue('pty:a', async () => { calls.push(data); }));
+  const restart = queue('pty:a', async () => { calls.push('restart'); });
+  const after = queue('pty:a', async () => { calls.push('after restart'); });
+  await queue('pty:b', async () => { calls.push('other terminal'); });
+  assert.deepEqual(calls, ['attach', 'other terminal']);
+  release();
+  await Promise.all([first, ...writes, restart, after]);
+  assert.deepEqual(calls, ['attach', 'other terminal', ...input, 'restart', 'after restart']);
+});
+
+test('terminal IPC reports failures without discarding subsequent writes', async () => {
+  const queue = createTerminalQueue();
+  const failure = new Error('terminal write failed');
+  const failed = queue('shell:a:1', async () => { throw failure; });
+  const reported = assert.rejects(failed, error => error === failure);
+  const calls = [];
+  const next = queue('shell:a:1', async () => { calls.push('next'); });
+  await Promise.all([reported, next]);
+  await queue('shell:a:1', async () => { calls.push('after idle'); });
+  assert.deepEqual(calls, ['next', 'after idle']);
+});
+
+test('settling an earlier terminal operation cannot erase a still-pending queue', async () => {
+  const queue = createTerminalQueue();
+  const calls = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const first = queue('pty:a', async () => { calls.push('first'); });
+  const second = queue('pty:a', async () => { calls.push('second'); await gate; });
+  await first;
+  // Let the first operation's cleanup run while the second one owns this terminal's queue.
+  await Promise.resolve();
+  const third = queue('pty:a', async () => { calls.push('third'); });
+  await Promise.resolve();
+  assert.deepEqual(calls, ['first', 'second']);
+  release();
+  await Promise.all([second, third]);
+  assert.deepEqual(calls, ['first', 'second', 'third']);
 });

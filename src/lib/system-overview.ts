@@ -157,10 +157,19 @@ export function initialOverviewState(): OverviewState {
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 const isActive = (status: SourceIndexStatus | null): boolean => status !== null && (status.state === "inventory" || status.state === "parsing" || status.state === "resolving");
 
-/** The index snapshot the page shows: the selected complete one, or the latest partial attempt when the user chose to view it. */
+/** The latest attempt when it left a usable partial index (a repository over the serialized fact limit never completes). */
+function partialAttempt(attempt: SourceIndexStatus | null): SourceIndexStatus | null {
+  return attempt?.state === "partial" && attempt.snapshotId ? attempt : null;
+}
+
+/**
+ * The index snapshot the page shows: the selected complete one, or the latest partial attempt when the user chose to view
+ * it or no complete index exists. A partial index never replaces a complete one on its own.
+ */
 export function effectiveIndex(state: Pick<OverviewState, "index">): SourceIndexStatus | null {
   const { selected, attempt, viewPartial } = state.index;
-  if (viewPartial && attempt?.state === "partial" && attempt.snapshotId) return attempt;
+  const partial = partialAttempt(attempt);
+  if (partial && (viewPartial || !selected)) return partial;
   return selected;
 }
 
@@ -408,7 +417,8 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
       applySelection(selection, mine);
       const key = repoKey(folder);
       // First visit of a repository: index it once, locally. Opening again (or failing) never starts another one silently.
-      if (startIfMissing && !selection.selected && !isActive(selection.latestAttempt) && !autoStarted.has(key)) {
+      // A saved partial index is shown as it is: indexing again would only reach the same limit.
+      if (startIfMissing && !selection.selected && !partialAttempt(selection.latestAttempt) && !isActive(selection.latestAttempt) && !autoStarted.has(key)) {
         autoStarted.add(key);
         await start(mine);
       }

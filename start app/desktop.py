@@ -20,7 +20,8 @@ def main():
     try:
         if select.select([parent], [], [], 0)[0]:
             return 1
-        child = subprocess.Popen(sys.argv[2:])
+        # Only descriptors the launcher passed on purpose (pass_fds, e.g. wayvnc's listener) are inheritable here.
+        child = subprocess.Popen(sys.argv[2:], close_fds=False)
         while child.poll() is None:
             if stopped or select.select([parent], [], [], 0.25)[0]:
                 break

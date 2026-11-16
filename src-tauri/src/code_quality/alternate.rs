@@ -33,6 +33,13 @@ const PROFILE: &str = include_str!("../../../bridge/code-quality/megalinter.yml"
 const OWN_RULES: &str = include_str!("../../../bridge/code-quality/rules/omp-quality.yml");
 const MAX_REPORT: u64 = 64 * 1024 * 1024;
 const MAX_DEPENDENCIES: u64 = 4 * 1024 * 1024 * 1024;
+/// The architecture every pinned alternate tool (MegaLinter digest, Opengrep musllinux x86 binary)
+/// is locked to. `tools.lock.json.platform` must state exactly this; every build and container of
+/// this pipeline requests it explicitly instead of inheriting the engine's native architecture.
+const ALTERNATE_PLATFORM: &str = "linux/amd64";
+/// Mixed into the derived image identity, so a local image built before the platform was explicit
+/// (possibly for the wrong architecture) can never skip the mandatory build-time validation.
+const PLATFORM_CONTRACT: &str = "platform-contract-v1";
 const ASSETS: &[(&str, &str)] = &[
     (
         "Dockerfile",
@@ -210,7 +217,8 @@ pub fn require_acknowledged(config_root: &Path) -> Result<()> {
     }
 }
 
-/// A changed managed asset changes the derived image identity, including fallback/config changes.
+/// A changed managed asset or platform contract changes the derived image identity, including
+/// fallback/config changes.
 #[must_use]
 pub fn image_name() -> String {
     let mut digest = Sha256::new();
@@ -218,6 +226,10 @@ pub fn image_name() -> String {
         digest.update(name.as_bytes());
         digest.update([0]);
         digest.update(contents.as_bytes());
+        digest.update([0]);
+    }
+    for part in [PLATFORM_CONTRACT, ALTERNATE_PLATFORM] {
+        digest.update(part.as_bytes());
         digest.update([0]);
     }
     let digest = format!("{:x}", digest.finalize());
@@ -527,7 +539,7 @@ pub fn prepare_alternate(
         )?;
         materialize_rules(&rules_archive, &context, control)?;
         control.say("Building pinned alternate analysis image; both grep engines must validate the exact rule pack and safe/unsafe fixtures.");
-        engine.build_image(&image, &context, control)?;
+        engine.build_image(&image, &context, Some(ALTERNATE_PLATFORM), control)?;
         if !engine.image_exists(&image, control)? {
             return Err("Alternate image build returned without the pinned image; setup remains incomplete.".into());
         }
@@ -550,6 +562,9 @@ fn validate_profile_data(profile_text: &str, lock_text: &str) -> Result<()> {
     let profile: Value = serde_yaml_ng::from_str(profile_text)
         .map_err(|e| io_error("parse managed lint profile", e))?;
     let lock = json(lock_text)?;
+    if lock.get("platform").and_then(Value::as_str) != Some(ALTERNATE_PLATFORM) {
+        return Err(format!("Shipped code quality tool lock must target {ALTERNATE_PLATFORM}; the alternate pipeline is pinned to that architecture."));
+    }
     let allow: HashSet<&str> = [
         "eslint",
         "ruff",
@@ -785,6 +800,7 @@ fn spec(run: &AlternateRun<'_>, action: &str, image: &str, network: Option<&str>
             ("SEMGREP_ENABLE_VERSION_CHECK".into(), "0".into()),
             ("DO_NOT_TRACK".into(), "1".into()),
         ],
+        platform: Some(ALTERNATE_PLATFORM.into()),
         ..ContainerSpec::default()
     }
 }
@@ -1666,10 +1682,10 @@ mod tests {
             self.calls.lock().push("image_exists".into());
             Ok(true)
         }
-        fn pull(&self, _: &str, _: &RunControl) -> Result<()> {
+        fn pull(&self, _: &str, _: Option<&str>, _: &RunControl) -> Result<()> {
             panic!("fixtures never pull")
         }
-        fn build_image(&self, _: &str, _: &Path, _: &RunControl) -> Result<()> {
+        fn build_image(&self, _: &str, _: &Path, _: Option<&str>, _: &RunControl) -> Result<()> {
             panic!("fixtures never build")
         }
         fn network_create(&self, _: &str, _: &[(String, String)], _: &RunControl) -> Result<()> {
@@ -1682,6 +1698,11 @@ mod tests {
             let action = &spec.command[0];
             self.calls.lock().push(action.clone());
             assert_eq!(spec.cpus, Some(2.0));
+            assert_eq!(
+                spec.platform.as_deref(),
+                Some("linux/amd64"),
+                "every alternate action requests the locked platform"
+            );
             assert_eq!(spec.memory.as_deref(), Some("4g"));
             assert!(spec.volumes.is_empty());
             assert!(spec.secret_env.is_empty());
@@ -1864,6 +1885,58 @@ mod tests {
         assert!(validate_profile_data(PROFILE, &lock.to_string()).is_err());
         assert!(PROFILE.contains("--redact=100"));
         assert!(PROFILE.contains("--validation=false"));
+    }
+    #[test]
+    fn tool_lock_must_state_the_amd64_platform_contract() {
+        assert_eq!(json(LOCK).unwrap()["platform"], "linux/amd64");
+        for platform in [
+            Value::from("linux/arm64"),
+            Value::from(""),
+            Value::Null,
+            Value::from(1),
+        ] {
+            let mut lock = json(LOCK).unwrap();
+            lock["platform"] = platform.clone();
+            let error = validate_profile_data(PROFILE, &lock.to_string()).unwrap_err();
+            assert!(error.contains("linux/amd64"), "{platform}: {error}");
+        }
+        let mut lock = json(LOCK).unwrap();
+        lock.as_object_mut().unwrap().remove("platform");
+        assert!(validate_profile_data(PROFILE, &lock.to_string()).is_err());
+    }
+    #[test]
+    fn derived_image_identity_includes_the_platform_contract() {
+        // The identity used before the platform was explicit: assets only.
+        let mut legacy = Sha256::new();
+        for (name, contents) in ASSETS {
+            legacy.update(name.as_bytes());
+            legacy.update([0]);
+            legacy.update(contents.as_bytes());
+            legacy.update([0]);
+        }
+        let legacy = format!("{:x}", legacy.finalize());
+        let current = image_name();
+        assert_ne!(
+            current,
+            format!("localhost/omp-quality-alternate:{}", &legacy[..24]),
+            "an image built without the platform contract must not satisfy image_exists"
+        );
+        let mut expected = Sha256::new();
+        for (name, contents) in ASSETS {
+            expected.update(name.as_bytes());
+            expected.update([0]);
+            expected.update(contents.as_bytes());
+            expected.update([0]);
+        }
+        for part in ["platform-contract-v1", "linux/amd64"] {
+            expected.update(part.as_bytes());
+            expected.update([0]);
+        }
+        let expected = format!("{:x}", expected.finalize());
+        assert_eq!(
+            current,
+            format!("localhost/omp-quality-alternate:{}", &expected[..24])
+        );
     }
     #[test]
     fn license_admission_has_no_engine_network_or_filesystem_side_effects() {

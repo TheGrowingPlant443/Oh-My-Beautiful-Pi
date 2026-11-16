@@ -384,6 +384,17 @@ pub(crate) fn executable_allowed(
         ] {
             allowed.push(path.into());
         }
+        #[cfg(target_os = "macos")]
+        if let Some(home) = env("HOME").map(PathBuf::from) {
+            for bundle in [
+                "Google Chrome.app/Contents/MacOS/Google Chrome",
+                "Chromium.app/Contents/MacOS/Chromium",
+                "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "Brave Browser.app/Contents/MacOS/Brave Browser",
+            ] {
+                allowed.push(home.join("Applications").join(bundle));
+            }
+        }
     }
     if allowed
         .iter()
@@ -1578,6 +1589,26 @@ mod tests {
             "browser_executable_refused"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn user_browser_bundles_do_not_admit_other_home_executables() {
+        let root = std::env::temp_dir().join(format!("omp-browser-home-{}", uuid::Uuid::new_v4()));
+        let home = root.join("Local User");
+        let browser = home.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        let stranger = home.join("Downloads/Google Chrome");
+        fs::create_dir_all(browser.parent().unwrap()).unwrap();
+        fs::create_dir_all(stranger.parent().unwrap()).unwrap();
+        fs::write(&browser, b"fixture").unwrap();
+        fs::write(&stranger, b"fixture").unwrap();
+        let env = |key: &str| (key == "HOME").then(|| home.as_os_str().to_owned());
+        assert_eq!(executable_allowed(&browser, &root, &env), Ok(()));
+        assert_eq!(
+            executable_allowed(&stranger, &root, &env).unwrap_err().code,
+            "browser_executable_refused"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(any(windows, unix))]

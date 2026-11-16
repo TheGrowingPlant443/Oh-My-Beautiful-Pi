@@ -9,10 +9,10 @@ export interface QualityLoginDetails { serverUrl: string; login: string | null; 
 export interface QualityOwnership { status: "owned" | "otherProcess" | "transferring" | "handedOff"; ownerPid: number | null }
 export interface QualityState {
   revision: number; config: QualityConfig; effectiveMode: QualityMode | null; phase: QualityPhase; busy: boolean; operationId: string | null;
-  requestedConfig: QualityConfig | null; error: string | null; activated: boolean;
+  requestedConfig: QualityConfig | null; error: string | null; fatal: boolean; activated: boolean;
   ownership: QualityOwnership; suspended: boolean;
   community: { running: boolean | null; url: string | null; runtimeId: string | null };
-  credentials: { community: boolean; enterprise: boolean };
+  credentials: { checked: boolean; error: string | null; community: boolean; enterprise: boolean };
   rules: { manifestHash: string; licenseHash: string; acknowledged: boolean; licenseText: string };
   prerequisites: { runtime: QualityRuntime; installed: boolean; ready: boolean; needsRestart: boolean; message: string | null }[];
   options: { wslDistros: string[]; podmanConnections: string[]; wingetAvailable: boolean; podmanAppConnection: string | null; wslFeaturesMissing: boolean };
@@ -103,19 +103,25 @@ export function scanPresentation(scan: Pick<QualityScan, "status" | "findings" |
   return { label: labels[scan.status], tone };
 }
 export function isActiveScan(scan: QualityScan | null): boolean { return scan?.status === "running" || scan?.status === "cancelling"; }
+/** Fatal persisted state prevents admission; an ordinary scan/setup error does not cancel a pending check. */
+export function credentialCheckPending(q: QualityState | null): boolean {
+  return !!q && q.ownership.status === "owned" && !q.credentials.checked && !q.fatal;
+}
 
-export type QualityScreen = "loading" | "ownership" | "setup" | "starting" | "failed" | "scan";
+export type QualityScreen = "loading" | "ownership" | "setup" | "starting" | "credentials" | "failed" | "scan";
 /** Which top-level page screen the committed backend state calls for; evaluated strictly in this order. */
 export function pageScreen(q: QualityState | null, entered: boolean): QualityScreen {
   // Before the open-view start has been admitted nothing is known yet; once it is running, show its progress.
   if (q == null || (!entered && !q.busy)) return "loading";
   if (q.ownership.status !== "owned") return "ownership";
+  if (q.fatal) return "failed";
   if (q.busy && (q.phase === "scanning" || q.phase === "cancelling")) return "scan";
   if (q.busy && q.phase === "installing") return "setup";
   if (q.busy) return "starting";
   if (q.suspended) return "scan";
   if (!q.activated || q.phase === "needsSetup" || q.phase === "needsRestart" || q.setup.needed) return "setup";
   if (q.phase === "error") return "failed";
+  if (q.config.mode !== "alternate" && !q.credentials.checked) return "credentials";
   if (q.effectiveMode === q.config.mode) return "scan";
   return "setup";
 }
@@ -123,6 +129,15 @@ export interface ScanActionInput { quality: QualityState | null; preparationRead
 export function scanAction(input: ScanActionInput): { label: string; kind: "scan" | "cancel" | "blocked"; reason: string | null } {
   if (input.locked || input.quality == null) return { label: "Scan project", kind: "blocked", reason: null };
   if (input.activeScanId) return { label: "Cancel scan", kind: "cancel", reason: null };
+  const q = input.quality;
+  if (q.ownership.status !== "owned") return { label: "Scan project", kind: "blocked", reason: null };
+  if (q.fatal) return { label: "Scan project", kind: "blocked", reason: q.error };
+  if (q.config.mode !== "alternate") {
+    if (!q.credentials.checked) return { label: "Scan project", kind: "blocked", reason: "Checking credentials…" };
+    if (q.credentials.error) return { label: "Scan project", kind: "blocked", reason: q.credentials.error };
+    const present = q.config.mode === "sonarqubeCommunity" ? q.credentials.community : q.credentials.enterprise;
+    if (!present) return { label: "Scan project", kind: "blocked", reason: "A saved user token is required." };
+  }
   if (input.selectionNeeded || input.entryNeeded) return { label: "Scan project", kind: "blocked", reason: "Choose the build family (and .NET entry file) under Advanced analysis options." };
   if (!input.preparationReady) return { label: "Scan project", kind: "blocked", reason: "Preparing…" };
   return { label: input.requiresConsent ? "Approve recipe and scan" : "Scan project", kind: "scan", reason: null };

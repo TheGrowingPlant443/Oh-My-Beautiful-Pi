@@ -237,12 +237,17 @@ fn run(args: Args) -> i32 {
         &mut scan,
         &mut containers,
     );
-    // All operations except start_scan are synchronous. Do not release the process lock while a
-    // scanner still owns the gate, including when loading a result failed after admission.
-    let workers = std::mem::take(&mut *svc.workers.lock());
-    for worker in workers {
-        if worker.join().is_err() {
-            result = Err("A code-quality worker terminated unexpectedly.".into());
+    // Join scans and credential-presence workers before releasing ownership, including when loading
+    // a scan result failed after admission. CLI construction never schedules desktop startup work.
+    loop {
+        let workers = std::mem::take(&mut *svc.workers.lock());
+        if workers.is_empty() {
+            break;
+        }
+        for worker in workers {
+            if worker.join().is_err() {
+                result = Err("A code-quality worker terminated unexpectedly.".into());
+            }
         }
     }
     let state = svc.state();
@@ -330,11 +335,18 @@ fn run_scan(svc: &Arc<CodeQualityService>, project: QualityProject) -> Result<Qu
     let admission = svc.start_scan(project, prepared.recipe_hash, /* consent */ true)?;
     // The service owns the one-hour watchdog and per-engine/server deadlines. Join
     // its actual jobs, not an unrelated HTTP submission or a second timeout policy.
-    let workers = std::mem::take(&mut *svc.workers.lock());
-    for worker in workers {
-        worker
-            .join()
-            .map_err(|_| "The scan worker terminated unexpectedly.")?;
+    let mut worker_failed = false;
+    loop {
+        let workers = std::mem::take(&mut *svc.workers.lock());
+        if workers.is_empty() {
+            break;
+        }
+        for worker in workers {
+            worker_failed |= worker.join().is_err();
+        }
+    }
+    if worker_failed {
+        return Err("The scan worker terminated unexpectedly.".into());
     }
     let completed = svc.read_scan(&admission.scan_id)?;
     if !completed.status.is_terminal() {

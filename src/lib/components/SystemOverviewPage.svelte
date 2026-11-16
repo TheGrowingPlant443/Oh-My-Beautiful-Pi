@@ -214,7 +214,7 @@
     {:else if status}<span>Indexed {when(status.indexedAt)} · {status.coverage?.admittedFiles.toLocaleString() ?? status.totalFiles.toLocaleString()} files{status.state === "partial" ? " · partial index" : ""}{status.sourceHash ? ` · ${status.sourceHash.slice(0, 12)}` : ""}</span>
     {:else}<span>No source index yet.</span>{/if}
     {#if status?.stale === true}<span class="badge warn" title="Only file metadata was compared. Refresh index re-reads content.">Files changed since this index (metadata); possibly stale</span>{/if}
-    {#if attempt && !indexing && attempt.state === "partial" && !s.index.viewPartial}<button onclick={() => systemOverview.viewPartial(true)}>View partial index</button>{/if}
+    {#if attempt && !indexing && attempt.state === "partial" && attempt.snapshotId !== status?.snapshotId}<button onclick={() => systemOverview.viewPartial(true)}>View partial index</button>{/if}
     {#if s.index.viewPartial}<button onclick={() => systemOverview.viewPartial(false)}>Back to the complete index</button>{/if}
     {#if attempt && (attempt.state === "failed" || attempt.state === "cancelled")}<span class="badge warn">Last refresh {attempt.state}{attempt.error ? `: ${attempt.error}` : ""}{status ? "; the earlier index is still shown." : ""}</span>{/if}
     {#if s.index.error}<span class="badge err" role="alert">{s.index.error}</span>{/if}

@@ -5,21 +5,13 @@
   const filterOverrides = new Set<string>();
   let filterSettingsKey: string | null = null;
 
-  // Deterministic start position from an FNV-1a hash of the package id (ForceAtlas2 needs distinct positions).
-  function seeded(id: string): { x: number; y: number } {
-    let h = 2166136261;
-    for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
-    const a = (h >>> 0) / 4294967296;
-    h = Math.imul(h ^ (h >>> 15), 2246822507);
-    h ^= h >>> 13;
-    return { x: (a - 0.5) * 200, y: ((h >>> 0) / 4294967296 - 0.5) * 200 };
-  }
 </script>
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
   import { on } from "svelte/events";
   import Graph from "graphology";
-  import forceAtlas2 from "graphology-layout-forceatlas2";
+  import LayoutWorker from "../overview-layout.worker?worker";
+  import { LayoutClient, positionMap, type LayoutWorkerLike } from "../overview-layout";
   import Sigma from "sigma";
   import { api } from "../api";
   import { errorText, instances, appSettings, knownStandardVersion, architectInstance, reportError, projectHistory, visibleProjectHistory, computedFolders, rememberProjectFolder } from "../stores";
@@ -156,6 +148,8 @@
   let hovered = $state<string | null>(null);
   let selected = $state<string | null>(null);
   let layoutMs = $state(0);
+  let layoutBusy = $state(false);
+  let layoutError = $state<string | null>(null);
   let container = $state<HTMLDivElement>();
   let pathTarget = $state<string | null>(null);
   let pathFromSearch = $state(false);
@@ -725,85 +719,112 @@
     if (picked) folder = picked;
   }
 
-  // One Sigma renderer per visible graph; the layout is computed up front so the first frame is already settled.
+  // ForceAtlas2 runs off the UI thread. Changing the view or leaving the page terminates its worker,
+  // so a superseded layout cannot consume CPU or install a stale renderer.
   $effect(() => {
     const view = displayed;
     const host = container;
     const scanned = graph;
     const judged = classification;
     const display = presentation;
+    const labels = forceLabels;
+    layoutBusy = false;
+    layoutError = null;
     if (held || display !== "graph" || !host || !scanned || view.nodes.length === 0) { layoutMs = 0; return; }
     const started = performance.now();
-    const inDegree = new Map<string, number>();
-    for (const [, to] of view.edges) inDegree.set(to, (inDegree.get(to) ?? 0) + 1);
-    const cache = layouts.get(scanned.key) ?? new Map<string, { x: number; y: number }>();
-    layouts.set(scanned.key, cache);
-    const built = new Graph({ type: "directed" });
-    for (const node of view.nodes) {
-      const at = cache.get(node.id) ?? seeded(node.id);
-      built.addNode(node.id, {
-        label: node.name,
-        labelVisibility: forceLabels ? "visible" : "auto",
-        size: node.id === ROOT ? 16 : nodeSize(inDegree.get(node.id) ?? 0),
-        color: nodeColor(node, judged.items[node.id]?.basic === true, null, untrack(() => differentIds.has(node.id))),
-        x: at.x,
-        y: at.y,
+    const layout = new LayoutClient(() => new LayoutWorker() as unknown as LayoutWorkerLike);
+    let cancelled = false;
+    let renderer: Sigma | null = null;
+    let updateCamera: (() => void) | null = null;
+    layoutBusy = true;
+    const render = async (): Promise<void> => {
+      const positions = await layout.run({
+        ids: view.nodes.map(node => node.id),
+        edges: view.edges,
+        seeds: layouts.get(scanned.key),
+        iterations: Math.min(500, Math.max(20, Math.round(1_500_000 / view.nodes.length))),
       });
-    }
-    for (const [from, to] of view.edges) if (!built.hasEdge(from, to)) built.addEdge(from, to, { size: 1, color: "#87919e" });
-    if (built.order > 1) {
-      forceAtlas2.assign(built, {
-        iterations: Math.min(500, Math.max(20, Math.round(1_500_000 / built.order))),
-        settings: { ...forceAtlas2.inferSettings(built), barnesHutOptimize: built.order > 500, slowDown: 5 },
-      });
-    }
-    built.forEachNode((id, attributes) => cache.set(id, { x: attributes.x as number, y: attributes.y as number }));
-    const renderer = new Sigma(built, host, {
-      settings: { enableCameraRotation: false, enableCameraMouseRotation: false, enableCameraPanning: true, enableCameraZooming: true, minCameraRatio: 0.02, maxCameraRatio: 3, renderEdgeLabels: false, labelRenderedSizeThreshold: 6, labelDensity: 0.6, itemSizesReference: "screen", enableEdgeEvents: false },
-      styles: {
-        nodes: [
-          { color: { attribute: "color" }, size: { attribute: "size", defaultValue: 6 }, label: { attribute: "label" }, labelVisibility: { attribute: "labelVisibility", defaultValue: "auto" }, labelColor: "#dfe6ef" },
-          { whenState: "isHovered", then: { labelVisibility: "visible" } },
-        ],
-        edges: [{ color: { attribute: "color" }, size: { attribute: "size", defaultValue: 1 } }],
-      },
-    });
-    activeRenderer = renderer;
-    const updateCamera = () => { const c = renderer.getCamera().getState(); cameraText = [c.x, c.y, c.ratio].map(value => value.toFixed(3)).join(","); };
-    updateCamera();
-    renderer.getCamera().on("updated", updateCamera);
-    renderer.on("rightClickNode", ({ node, event }) => { event.original.preventDefault(); if (node !== ROOT) setPath(node); });
-    renderer.on("rightClickStage", ({ event }) => { event.original.preventDefault(); setPath(null); });
-    renderer.on("doubleClickNode", ({ node, event }) => {
-      event.preventSigmaDefault();
-      const center = renderer.getNodeDisplayData(node);
-      if (!center) return;
-      const ids = view.edges.filter(([from]) => from === node).map(([, to]) => to);
-      const neighbors = ids.flatMap(id => { const data = renderer.getNodeDisplayData(id); return data ? [data] : []; });
-      const { width, height } = renderer.getDimensions();
-      const override = { cameraState: { x: .5, y: .5, angle: 0, ratio: 1 } };
-      const a = renderer.viewportToFramedGraph({ x: 0, y: 0 }, override);
-      const b = renderer.viewportToFramedGraph({ x: width, y: height }, override);
-      renderer.getCamera().animate(focusCamera(center, neighbors, { width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) }), { duration: 600 });
-      built.forEachNode(id => built.setNodeAttribute(id, "labelVisibility", forceLabels ? "visible" : "auto"));
-      for (const id of [node, ...ids]) built.setNodeAttribute(id, "labelVisibility", "visible");
-    });
-    renderer.on("enterNode", ({ node }) => { hovered = node; });
-    renderer.on("leaveNode", () => { hovered = null; });
-    renderer.on("clickNode", ({ node, event }) => {
-      const original = event.original;
-      if (original instanceof MouseEvent && (original.ctrlKey || original.metaKey)) {
-        event.preventSigmaDefault();
-        const target = view.nodes.find(entry => entry.id === node);
-        if (target) void openReview(target, "architect");
-        return;
+      if (cancelled || !positions) return;
+      const cache = positionMap(positions);
+      layouts.set(scanned.key, cache);
+      const inDegree = new Map<string, number>();
+      for (const [, to] of view.edges) inDegree.set(to, (inDegree.get(to) ?? 0) + 1);
+      const different = untrack(() => differentIds);
+      const built = new Graph({ type: "directed" });
+      for (const node of view.nodes) {
+        const at = cache.get(node.id)!;
+        built.addNode(node.id, {
+          label: node.name,
+          labelVisibility: labels ? "visible" : "auto",
+          size: node.id === ROOT ? 16 : nodeSize(inDegree.get(node.id) ?? 0),
+          color: nodeColor(node, judged.items[node.id]?.basic === true, null, different.has(node.id)),
+          x: at.x,
+          y: at.y,
+        });
       }
-      selected = node;
+      for (const [from, to] of view.edges) if (!built.hasEdge(from, to)) built.addEdge(from, to, { size: 1, color: "#87919e" });
+      const current = new Sigma(built, host, {
+        settings: { enableCameraRotation: false, enableCameraMouseRotation: false, enableCameraPanning: true, enableCameraZooming: true, minCameraRatio: 0.02, maxCameraRatio: 3, renderEdgeLabels: false, labelRenderedSizeThreshold: 6, labelDensity: 0.6, itemSizesReference: "screen", enableEdgeEvents: false },
+        styles: {
+          nodes: [
+            { color: { attribute: "color" }, size: { attribute: "size", defaultValue: 6 }, label: { attribute: "label" }, labelVisibility: { attribute: "labelVisibility", defaultValue: "auto" }, labelColor: "#dfe6ef" },
+            { whenState: "isHovered", then: { labelVisibility: "visible" } },
+          ],
+          edges: [{ color: { attribute: "color" }, size: { attribute: "size", defaultValue: 1 } }],
+        },
+      });
+      renderer = current;
+      activeRenderer = current;
+      updateCamera = () => { const c = current.getCamera().getState(); cameraText = [c.x, c.y, c.ratio].map(value => value.toFixed(3)).join(","); };
+      updateCamera();
+      current.getCamera().on("updated", updateCamera);
+      current.on("rightClickNode", ({ node, event }) => { event.original.preventDefault(); if (node !== ROOT) setPath(node); });
+      current.on("rightClickStage", ({ event }) => { event.original.preventDefault(); setPath(null); });
+      current.on("doubleClickNode", ({ node, event }) => {
+        event.preventSigmaDefault();
+        const center = current.getNodeDisplayData(node);
+        if (!center) return;
+        const ids = view.edges.filter(([from]) => from === node).map(([, to]) => to);
+        const neighbors = ids.flatMap(id => { const data = current.getNodeDisplayData(id); return data ? [data] : []; });
+        const { width, height } = current.getDimensions();
+        const override = { cameraState: { x: .5, y: .5, angle: 0, ratio: 1 } };
+        const a = current.viewportToFramedGraph({ x: 0, y: 0 }, override);
+        const b = current.viewportToFramedGraph({ x: width, y: height }, override);
+        current.getCamera().animate(focusCamera(center, neighbors, { width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) }), { duration: 600 });
+        built.forEachNode(id => built.setNodeAttribute(id, "labelVisibility", labels ? "visible" : "auto"));
+        for (const id of [node, ...ids]) built.setNodeAttribute(id, "labelVisibility", "visible");
+      });
+      current.on("enterNode", ({ node }) => { hovered = node; });
+      current.on("leaveNode", () => { hovered = null; });
+      current.on("clickNode", ({ node, event }) => {
+        const original = event.original;
+        if (original instanceof MouseEvent && (original.ctrlKey || original.metaKey)) {
+          event.preventSigmaDefault();
+          const target = view.nodes.find(entry => entry.id === node);
+          if (target) void openReview(target, "architect");
+          return;
+        }
+        selected = node;
+      });
+      current.on("clickStage", () => { selected = null; });
+      layoutMs = Math.round(performance.now() - started);
+      renderedGraph = built;
+    };
+    void render().catch(cause => {
+      if (!cancelled) layoutError = errorText(cause);
+    }).finally(() => {
+      layout.dispose();
+      if (!cancelled) layoutBusy = false;
     });
-    renderer.on("clickStage", () => { selected = null; });
-    layoutMs = Math.round(performance.now() - started);
-    renderedGraph = built;
-    return () => { renderer.getCamera().removeListener("updated", updateCamera); activeRenderer = null; renderer.kill(); renderedGraph = null; hovered = null; };
+    return () => {
+      cancelled = true;
+      layout.dispose();
+      if (renderer && updateCamera) renderer.getCamera().removeListener("updated", updateCamera);
+      if (activeRenderer === renderer) activeRenderer = null;
+      renderer?.kill();
+      renderedGraph = null;
+      hovered = null;
+    };
   });
 
   // HTTP responses update only colour attributes. They are deliberately not layout dependencies.
@@ -903,6 +924,7 @@
     <button disabled={classifying || !graph || pending.length === 0} title="Ask The Architect which direct dependencies are basic (built in) and which were chosen" onclick={classify}>Classify with The Architect</button>
     {/if}
   </header>
+  {#if loading}<p role="status">{graph ? "Loading saved package metadata…" : "Scanning local dependency manifests and installed packages…"} You can leave this page while it runs.</p>{/if}
   {#if held}
     <div class="held">
       <div class="held-panel">
@@ -941,7 +963,8 @@
   </ul>
   <p class="meta">Hover for package statistics and versions. Ctrl+click a package to open The Architect with its security review.</p>
   <p class="meta">Public metadata lookup sends package names to official registries and GitHub; it does not upload project files.</p>
-  {#if loading}<p role="status">Scanning dependencies…</p>{/if}
+  {#if layoutBusy}<p role="status">Laying out {displayed.nodes.length} nodes and {displayed.edges.length} edges… You can change filters, search, or <button onclick={() => { presentation = "list"; }}>Cancel layout and use list view</button>.</p>{/if}
+  {#if layoutError}<p class="alert err" role="alert">Graph layout failed: {layoutError} <button onclick={() => { presentation = "list"; }}>Use list view</button>. The scanned packages and relationships are still available.</p>{/if}
   {#if error}<div class="alert err alert-line" role="alert"><span>{error}</span>{@render manifestAssist()}</div>{:else}{@render manifestAssist()}{/if}
   {#if classifyError}<p class="alert err" role="alert">{classifyError}</p>{/if}
   {#if graph}

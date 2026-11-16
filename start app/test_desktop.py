@@ -7,6 +7,10 @@ import subprocess
 import sys
 import unittest
 
+if not sys.platform.startswith("linux"):
+    # desktop.py supervises Linux Weston with pidfds; macOS uses the VM display path.
+    raise unittest.SkipTest("Linux display helper")
+
 
 class DesktopLifetimeTests(unittest.TestCase):
     def test_creator_thread_exit_is_safe_but_launcher_exit_retires_children(self):

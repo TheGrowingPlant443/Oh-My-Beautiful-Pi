@@ -58,7 +58,7 @@
   const tcpFilters: { view: HostTcpView; label: string; metric: HostMetric | null; title: string }[] = [
     { view: "external", label: "External", metric: "external", title: "TCP connections whose remote address is not loopback or wildcard, including private network peers" },
     { view: "confirmedOutbound", label: "Confirmed outbound", metric: "confirmedOutbound", title: "Connections still in the SYN_SENT state: an observed connection attempt" },
-    { view: "unknownDirection", label: "Direction unknown", metric: "unknownDirection", title: "Established or closing connections: Windows does not record who started them" },
+    { view: "unknownDirection", label: "Direction unknown", metric: "unknownDirection", title: "Established or closing connections: the sampled tables do not identify who started them" },
     { view: "listeners", label: "Listeners", metric: null, title: "Ports a process is listening on" },
     { view: "all", label: "All TCP", metric: null, title: "Every TCP row, including loopback" },
   ];
@@ -196,7 +196,7 @@
               <tr>
                 <td>{row.name}
                   {#if row.owner}<span class="pill accent" title="Started by an agent managed by this app">{ownerLabel(row.owner, instanceId)}</span>{/if}
-                  {#if row.availability !== "available"}<span class="pill warn" title={row.availability === "limited" ? "Windows did not allow even a limited query of this process" : "This process ended while the snapshot was read"}>{row.availability === "limited" ? "limited access" : "exited"}</span>{/if}
+                  {#if row.availability !== "available"}<span class="pill warn" title={row.availability === "limited" ? "The operating system restricted access to this process" : "This process ended while the snapshot was read"}>{row.availability === "limited" ? "limited access" : "exited"}</span>{/if}
                 </td>
                 <td class="mono">{row.pid}</td>
                 <td class="mono">{row.parentPid ?? "—"}</td>
@@ -267,10 +267,10 @@
   <details class="limits">
     <summary>What this can and cannot show</summary>
     <ul>
-      <li>Established TCP connections carry no initiator in the Windows table, so their direction is unknown. Only a connection still in SYN_SENT is a confirmed outbound attempt.</li>
+      <li>Established TCP connections carry no initiator in the sampled tables, so their direction is unknown. Only a connection still in SYN_SENT is a confirmed outbound attempt.</li>
       <li>External means a TCP peer that is not loopback or wildcard. It includes private network (LAN) addresses and says nothing about intent.</li>
       <li>UDP has no peer or direction in the table; UDP endpoints are listed separately.</li>
-      <li>Processes Windows will not let this app open (protected or other users') are limited: they keep their PID, but their sockets may have no process name.</li>
+      <li>Processes the operating system will not let this app inspect (protected or other users') are limited: they keep their PID, but their sockets may have no process name.</li>
       <li>Only names, PIDs, parent PIDs, thread counts and addresses are collected: no CPU or memory use, command lines, environment, file paths or user names. Nothing can be ended or blocked from here.</li>
       <li>Sampling happens only while this tab is visible, and stops when it is hidden, covered, minimized or left.</li>
     </ul>

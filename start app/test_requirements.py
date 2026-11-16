@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from requirements import prepare_workspace
+from requirements import host_workspace, prepare_workspace
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -42,6 +42,18 @@ class WorkspaceTests(unittest.TestCase):
         metadata = SimpleNamespace(st_uid=os.getuid() + 1, st_mode=self.path.stat().st_mode)
         with patch('requirements.os.fstat', return_value=metadata), self.assertRaises(ValueError):
             prepare_workspace(self.path)
+
+    def test_host_workspace_resolves_only_the_system_alias_parent(self):
+        real = self.root / 'real'
+        real.mkdir()
+        alias = self.root / 'alias'
+        alias.symlink_to(real, target_is_directory=True)
+        (real / 'omp-manager').symlink_to(self.root, target_is_directory=True)
+        path = host_workspace(alias)
+        self.assertEqual(path, real.resolve() / 'omp-manager')
+        self.assertTrue(path.is_symlink())
+        with self.assertRaises(OSError):
+            prepare_workspace(path)
 
 
 if __name__ == '__main__':

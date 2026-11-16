@@ -2,13 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, rm, mkdir, readFile, cp } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installNativeDecisions, NATIVE_UI_CAPTURE_ERROR } from './omp-native-ui.mjs';
 import { installWorkspaceChanges } from './omp-workspace.mjs';
 import { nativeAnswer, confirmedPlanHandoff, controlAllowed } from './omp-manager.mjs';
+import { prepareSdkNatives } from './fixtures/sdk-natives.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 function fixture({ install = true } = {}) {
@@ -320,9 +321,7 @@ test('installed SDK raw controller → handler proxies → real native component
   const root = await mkdtemp(path.join(os.homedir(), '.omp-native-ui-'));
   try {
     await mkdir(path.join(root, 'agent'), { recursive: true });
-    const { version } = JSON.parse(await readFile(path.join(process.env.OMP_SDK_DIR, 'package.json'), 'utf8'));
-    const nativeRoot = path.join(root, 'natives');
-    await cp(path.join(process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'), version), path.join(nativeRoot, version), { recursive: true });
+    const nativeRoot = await prepareSdkNatives(process.env.OMP_SDK_DIR, root);
     // PI_CONFIG_DIR is relative to the real Windows home. Never override
     // USERPROFILE: native addon lookup and session confinement depend on it.
     const config = path.relative(os.homedir(), path.join(root, 'config'));

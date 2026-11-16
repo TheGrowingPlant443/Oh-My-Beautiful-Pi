@@ -1,4 +1,5 @@
-//! Unix listener/process inventory; macOS proc_pidpath has no std equivalent for an executable path.
+//! Unix listener/process inventory. Native NUL-delimited argv (Darwin KERN_PROCARGS2
+//! or Linux procfs) preserves argument identity without interpreting shell display text.
 use super::live::{Listener, Row};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -88,64 +89,168 @@ pub(super) fn query_processes() -> Result<Vec<Row>, String> {
         if file.take(32769).read_to_end(&mut bytes).is_err() || bytes.len() > 32768 {
             continue;
         }
-        let Ok(text) = std::str::from_utf8(&bytes) else {
+        let Some(argv) = nul_arguments(&bytes) else {
             continue;
         };
-        let cmd = text
-            .split('\0')
-            .filter(|s| !s.is_empty())
-            .map(|arg| format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\"")))
-            .collect::<Vec<_>>()
-            .join(" ");
+        if creation_time(pid) != Some(created) {
+            continue;
+        }
         rows.push(Row {
             pid,
             created,
             exe: exe.to_string_lossy().into_owned(),
-            cmd,
+            argv,
         });
     }
     Ok(rows)
 }
 
+/// `/proc` already supplies argument boundaries. Remove only its final terminator,
+/// never empty arguments or literal quotes/backslashes inside an argument.
+#[cfg(any(target_os = "linux", test))]
+fn nul_arguments(bytes: &[u8]) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(bytes.strip_suffix(&[0])?).ok()?;
+    Some(text.split('\0').map(str::to_owned).collect())
+}
+
+#[cfg(any(target_os = "macos", test))]
+const MAX_PROCARGS: usize = 1024 * 1024;
+
+/// Darwin supplies native argc, an executable-path header, padding, then argv and
+/// environment strings. Only the first argc arguments belong to the command.
+#[cfg(any(target_os = "macos", test))]
+fn procargs_arguments(bytes: &[u8]) -> Option<Vec<String>> {
+    if bytes.len() > MAX_PROCARGS {
+        return None;
+    }
+    let width = std::mem::size_of::<libc::c_int>();
+    let argc = libc::c_int::from_ne_bytes(bytes.get(..width)?.try_into().ok()?);
+    let argc = usize::try_from(argc).ok().filter(|&n| n > 0)?;
+    let header = bytes.get(width..)?;
+    let end = header.iter().position(|&byte| byte == 0)?;
+    if end == 0 {
+        return None;
+    }
+    let mut rest = header.get(end + 1..)?;
+    let start = rest.iter().position(|&byte| byte != 0)?;
+    rest = &rest[start..];
+    // Every argument needs a terminator; reject impossible argc before allocating.
+    if argc > rest.len() {
+        return None;
+    }
+    let mut argv = Vec::new();
+    for _ in 0..argc {
+        let end = rest.iter().position(|&byte| byte == 0)?;
+        argv.push(std::str::from_utf8(&rest[..end]).ok()?.to_owned());
+        rest = &rest[end + 1..];
+    }
+    Some(argv)
+}
+
+#[cfg(target_os = "macos")]
+fn argument_buffer() -> Option<Vec<u8>> {
+    let mut maximum: libc::c_int = 0;
+    let mut length = std::mem::size_of_val(&maximum);
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: the output is a native c_int with its exact writable size.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            (&mut maximum as *mut libc::c_int).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || length != std::mem::size_of_val(&maximum) {
+        return None;
+    }
+    let maximum = usize::try_from(maximum).ok()?;
+    if maximum == 0 || maximum > MAX_PROCARGS {
+        return None;
+    }
+    Some(vec![0u8; maximum])
+}
+
+#[cfg(target_os = "macos")]
+fn process_arguments(pid: libc::pid_t, bytes: &mut [u8]) -> Option<Vec<String>> {
+    let mut length = bytes.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: sysctl receives the bounded writable buffer and its size, and returns
+    // the actual byte count. A failed/truncated query is never parsed.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || length > bytes.len() {
+        return None;
+    }
+    procargs_arguments(&bytes[..length])
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn query_processes() -> Result<Vec<Row>, String> {
-    let mut command = std::process::Command::new("/bin/ps");
-    command.args(["-axo", "pid=,command="]);
-    let output = crate::code_diff::run_timed(
-        command,
-        None,
-        std::time::Duration::from_secs(15),
-        "macOS process inspection failed",
-    )?;
-    if !output.status.success() {
+    // SAFETY: a null buffer queries the count; the second call writes at most the
+    // supplied byte size to a suitably aligned pid_t buffer.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count < 0 || count as usize > MAX_PROCARGS / std::mem::size_of::<libc::pid_t>() - 256 {
         return Err("macOS process inspection failed".into());
     }
+    let mut pids = vec![0 as libc::pid_t; count as usize + 256];
+    let count = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<libc::pid_t>()) as i32,
+        )
+    };
+    if count < 0 || count as usize >= pids.len() {
+        return Err("macOS process inspection failed".into());
+    }
+    let mut arguments = argument_buffer().ok_or("macOS process argument limit is unavailable or exceeds 1 MiB")?;
     let mut rows = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((pid, cmd)) = line.trim().split_once(char::is_whitespace) else {
+    for &pid in &pids[..count as usize] {
+        if pid <= 0 {
             continue;
-        };
-        let Some(pid) = pid.parse::<u32>().ok() else {
-            continue;
-        };
-        let Some(created) = creation_time(pid) else {
+        }
+        let Some(created) = creation_time(pid as u32) else {
             continue;
         };
         let mut buffer = [0u8; 4096];
         // SAFETY: buffer is a valid writable byte array; proc_pidpath writes at most its length.
         let length = unsafe {
-            libc::proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32)
+            libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32)
         };
-        if length <= 0 {
+        if length <= 0 || length as usize >= buffer.len() {
             continue;
         }
-        let length = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
-        let exe = String::from_utf8_lossy(&buffer[..length]).into_owned();
+        let Ok(exe) = std::str::from_utf8(&buffer[..length as usize]) else {
+            continue;
+        };
+        let name = std::path::Path::new(exe)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if !name.starts_with("python") && name != "Python" && name != "node" {
+            continue;
+        }
+        let Some(argv) = process_arguments(pid, &mut arguments) else {
+            continue;
+        };
+        if creation_time(pid as u32) != Some(created) {
+            continue;
+        }
         rows.push(Row {
-            pid,
+            pid: pid as u32,
             created,
-            exe,
-            cmd: cmd.trim().to_string(),
+            exe: exe.to_owned(),
+            argv,
         });
     }
     Ok(rows)
@@ -156,6 +261,89 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn native_argument_records_preserve_boundaries_and_ignore_environment() {
+        let args = ["/tmp/Cognee café/venv/bin/python", "-m", "uvicorn", "", "a\"b\\c", ""];
+        let mut nul = args.join("\0").into_bytes();
+        nul.push(0);
+        assert_eq!(nul_arguments(&nul).unwrap(), args);
+        assert!(nul_arguments(b"unterminated").is_none());
+        assert!(nul_arguments(b"\xff\0").is_none());
+
+        let mut darwin = (args.len() as libc::c_int).to_ne_bytes().to_vec();
+        darwin.extend_from_slice(b"/Library/Frameworks/Python.framework/Python\0\0\0");
+        darwin.extend_from_slice(&nul);
+        darwin.extend_from_slice(b"SECRET=not an argument\0");
+        assert_eq!(procargs_arguments(&darwin).unwrap(), args);
+        assert!(procargs_arguments(&[0; 3]).is_none());
+        assert!(procargs_arguments(&vec![0; MAX_PROCARGS + 1]).is_none());
+        for argc in [-1 as libc::c_int, 0, libc::c_int::MAX] {
+            let mut malformed = darwin.clone();
+            malformed[..std::mem::size_of::<libc::c_int>()]
+                .copy_from_slice(&argc.to_ne_bytes());
+            assert!(procargs_arguments(&malformed).is_none());
+        }
+        let mut truncated = (2 as libc::c_int).to_ne_bytes().to_vec();
+        truncated.extend_from_slice(b"/python\0\0/python\0missing terminator");
+        assert!(procargs_arguments(&truncated).is_none());
+        let mut invalid = (1 as libc::c_int).to_ne_bytes().to_vec();
+        invalid.extend_from_slice(b"/python\0\0\xff\0");
+        assert!(procargs_arguments(&invalid).is_none());
+    }
+
+    #[test]
+    fn backend_argv_preserves_unicode_venv_and_rejects_empty_or_combined_options() {
+        use super::super::components::Backend;
+        use super::super::live::verify_backends;
+        let root = std::env::temp_dir()
+            .join(format!("omp Cognee café \"quoted\"-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("venv/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let python = bin.join("python");
+        let args = [
+            python.to_str().unwrap(), "-m", "uvicorn", "cognee.api.client:app",
+            "--host", "127.0.0.1", "--port", "8000",
+        ];
+        let mut row = Row {
+            pid: 42,
+            created: 100,
+            exe: "/Library/Frameworks/Python.framework/Python".into(),
+            argv: args.into_iter().map(str::to_owned).collect(),
+        };
+        let listeners = [Listener {
+            address: "127.0.0.1".parse().unwrap(),
+            port: 8000,
+            pid: row.pid,
+        }];
+        let verify = |row: &Row| verify_backends(std::slice::from_ref(row), &listeners, &python, &|_| Some(100));
+        assert_eq!(verify(&row), vec![Backend {
+            pid: row.pid, port: 8000, address: listeners[0].address,
+        }]);
+        assert!(verify_backends(std::slice::from_ref(&row), &listeners, &python, &|_| Some(200)).is_empty());
+        row.argv.insert(4, String::new());
+        assert!(verify(&row).is_empty());
+        row.argv.remove(4);
+        row.argv.splice(6..8, ["--port 8000".into()]);
+        assert!(verify(&row).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_inventory_reads_real_argv_without_shell_tokenization() {
+        let python = crate::toolchain::find_program("python3")
+            .expect("the native test environment supplies Python 3");
+        let args = ["-c", "import time; time.sleep(30)", "", "café with spaces", "literal\"quote\\slash", ""];
+        let mut child = Command::new(&python).args(args).spawn().unwrap();
+        // Always retire the fixture before asserting, including inventory errors.
+        let rows = query_processes();
+        let _ = child.kill();
+        let _ = child.wait();
+        let row = rows.unwrap().into_iter().find(|row| row.pid == child.id())
+            .expect("the real Python process appears in the native inventory");
+        assert_eq!(row.argv[0], python.to_str().unwrap());
+        assert_eq!(&row.argv[1..], &args);
+    }
 
     #[test]
     fn a_loopback_listener_is_attributed_to_the_process_that_bound_it() {

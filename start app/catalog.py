@@ -1,12 +1,16 @@
 """Read-only host suggestions; choosing one still goes through policy validation."""
 import collections
 import configparser
+import copy
 import os
 from pathlib import Path
 import re
 import shlex
 import shutil
+import sys
 import time
+
+from packages import LANGUAGE_SERVER_COMMANDS, PACKAGE_CHOICES, SYSTEM
 
 
 DEFAULT_WEBSITES = ["https://github.com", "https://www.google.com", "https://stackoverflow.com", "https://www.atlassian.com"]
@@ -61,6 +65,8 @@ def user_folders(home=None, environ=None):
     names = {"DESKTOP": "Desktop", "DOCUMENTS": "Documents", "DOWNLOAD": "Downloads",
              "PICTURES": "Pictures", "MUSIC": "Music", "VIDEOS": "Videos",
              "PUBLICSHARE": "Public", "TEMPLATES": "Templates"}
+    if sys.platform == "darwin":
+        names["VIDEOS"] = "Movies"
     paths = {key: home / name for key, name in names.items()}
     config = _xdg_directory(environ, "XDG_CONFIG_HOME", home / ".config") / "user-dirs.dirs"
     try:
@@ -246,5 +252,14 @@ def installed_programs(home=None, environ=None, store_root=Path("/nix/store"),
     return result
 
 
+def package_catalog():
+    """Static installable-package metadata for the Linux target that runs isolated programs.
+
+    Needs no store, VM or download, so macOS can offer it before its VM is prepared.
+    """
+    return {"system": SYSTEM, "packages": copy.deepcopy(PACKAGE_CHOICES),
+            "language_servers": list(LANGUAGE_SERVER_COMMANDS)}
+
+
 def catalog():
-    return {"gpu": detect_gpu(), "folders": user_folders(), "programs": installed_programs()}
+    return {"gpu": detect_gpu(), "folders": user_folders(), "programs": installed_programs(), **package_catalog()}

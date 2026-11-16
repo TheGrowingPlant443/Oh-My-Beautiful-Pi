@@ -105,6 +105,10 @@ pub struct Pty {
     pub cols: u16,
     pub rows: u16,
     exit: Option<u32>,
+    /// An observed root exit does not release the PID until its session is retired.
+    reaped: bool,
+    /// Session retirement is separate from observing/reaping the root's exit.
+    retired: bool,
     /// PID plus creation time captured while the PTY owns the child handle; read-only attribution for the host monitor.
     root: Option<ProcessIdentity>,
     _config_directory: Option<ConfigDirectory>,
@@ -393,6 +397,8 @@ impl Pty {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             exit: None,
+            reaped: false,
+            retired: false,
             root,
             _config_directory: None,
         })
@@ -406,39 +412,123 @@ impl Pty {
     }
     /// Immediate termination for a shell the user closed; OMP uses `stop` for a graceful Ctrl-C first.
     pub fn kill(&mut self) -> Result<(), String> {
+        #[cfg(not(unix))]
         if self.poll()?.is_some() {
             return Ok(());
         }
-        let session = self.kill_process_group();
-        // Reap the root even when a session member (e.g. after sudo) could not be signalled.
+        if self.reaped && self.retired {
+            return Ok(());
+        }
+        // Keep the leader unreaped if retirement fails, so a later attempt still
+        // owns the session identity rather than a potentially recycled PID.
+        self.kill_process_group()?;
         self.child.kill().map_err(|e| e.to_string())?;
         self.exit = Some(self.child.wait().map_err(|e| e.to_string())?.exit_code());
-        session
+        self.reaped = true;
+        Ok(())
     }
     /// portable-pty creates a session. Shell job-control groups must also be retired before the leader is reaped.
-    fn kill_process_group(&self) -> Result<(), String> {
+    fn kill_process_group(&mut self) -> Result<(), String> {
+        if self.retired {
+            return Ok(());
+        }
         #[cfg(unix)]
-        if let Some(pid) = self.child.process_id() {
+        {
+            let pid = self.child.process_id().ok_or("PTY root identity is unavailable")?;
             crate::process_tree::kill_session(pid)?;
         }
+        self.retired = true;
         Ok(())
+    }
+    #[cfg(unix)]
+    fn root_exit_unreaped(&self) -> Result<Option<u32>, String> {
+        let pid = self.child.process_id().ok_or("PTY root identity is unavailable")?;
+        // portable-pty owns this direct child and no other code waits on it.
+        // WNOWAIT leaves even an exited leader reserved until every session member
+        // is retired; unlike try_wait, it cannot open a PID/session-reuse window.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: info is a writable siginfo_t and pid names our owned child.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                if info.si_signo != libc::SIGCHLD {
+                    return Ok(None);
+                }
+                // Match portable-pty: ordinary exit status, or 1 for signal death.
+                #[cfg(target_os = "macos")]
+                let status = info.si_status;
+                #[cfg(target_os = "linux")]
+                // SAFETY: waitid populated the SIGCHLD variant of siginfo_t.
+                let status = unsafe { info.si_status() };
+                return Ok(Some(if info.si_code == libc::CLD_EXITED {
+                    status as u32
+                } else {
+                    1
+                }));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(format!("Inspect PTY root exit: {error}"));
+            }
+        }
     }
     #[must_use]
     pub fn last_output(&self) -> u64 {
         self.shared.last_output.load(Ordering::Relaxed)
     }
     pub fn poll(&mut self) -> Result<Option<u32>, String> {
-        if self.exit.is_none() {
-            self.exit = self
-                .child
-                .try_wait()
-                .map_err(|e| e.to_string())?
-                .map(|s| s.exit_code());
+        #[cfg(unix)]
+        {
+            self.poll_unix(crate::process_tree::try_kill_session)
         }
-        if self.exit.is_some() {
-            self._config_directory = None;
+        #[cfg(not(unix))]
+        {
+            if self.exit.is_none() {
+                self.exit = self.child.try_wait().map_err(|e| e.to_string())?
+                    .map(|status| status.exit_code());
+            }
+            if self.exit.is_some() {
+                self.reaped = true;
+                self.retired = true;
+                self._config_directory = None;
+            }
+            Ok(self.exit)
+        }
+    }
+    #[cfg(unix)]
+    fn poll_unix(
+        &mut self,
+        retire: impl FnOnce(u32) -> Result<bool, String>,
+    ) -> Result<Option<u32>, String> {
+        if self.exit.is_none() {
+            self.exit = self.root_exit_unreaped()?;
+        }
+        if self.exit.is_some() && !self.reaped {
+            if !self.retired {
+                let pid = self.child.process_id().ok_or("PTY root identity is unavailable")?;
+                // Routine UI polling never waits for an unsignalable or stuck member.
+                // Keep the zombie leader reserved and let later polls verify retirement;
+                // explicit kill/stop/drop retain the bounded retirement wait.
+                self.retired = retire(pid)?;
+            }
+            if self.retired {
+                self.exit = Some(self.child.wait().map_err(|e| e.to_string())?.exit_code());
+                self.reaped = true;
+                self._config_directory = None;
+            }
         }
         Ok(self.exit)
+    }
+    /// Root exit is observable even while session retirement is pending or failed.
+    pub fn exit_code(&self) -> Option<u32> {
+        self.exit
     }
     pub fn write(&mut self, data: &str) -> Result<(), String> {
         if self.poll()?.is_some() {
@@ -501,7 +591,7 @@ impl Pty {
     }
     pub fn stop(&mut self) -> Result<(), String> {
         if self.poll()?.is_some() {
-            return Ok(());
+            return self.kill();
         }
         let _ = self.write("\x03");
         std::thread::sleep(Duration::from_millis(300));
@@ -509,20 +599,21 @@ impl Pty {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if self.poll()?.is_some() {
-                return Ok(());
+                return self.kill();
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let session = self.kill_process_group();
+        self.kill_process_group()?;
         self.child.kill().map_err(|e| e.to_string())?;
         self.exit = Some(self.child.wait().map_err(|e| e.to_string())?.exit_code());
+        self.reaped = true;
         self._config_directory = None;
-        session
+        Ok(())
     }
 }
 impl Drop for Pty {
     fn drop(&mut self) {
-        if self.exit.is_none() {
+        if !self.reaped {
             let _ = self.kill_process_group();
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -716,6 +807,109 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn natural_root_exit_retires_background_children_before_reaping() {
+        struct Cleanup(crate::host_monitor::ProcessIdentity);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if crate::host_monitor::capture_identity(self.0.pid) == Some(self.0) {
+                    // SAFETY: this is the fixture's observed child, with its creation
+                    // identity rechecked; cleanup is also needed if an assertion fails.
+                    unsafe { libc::kill(self.0.pid as libc::pid_t, libc::SIGKILL); }
+                }
+            }
+        }
+        for action in ["poll", "kill", "stop", "drop"] {
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            // HUP is ignored by the child so kernel terminal hangup alone cannot
+            // make this regression pass. The root waits until its PID was captured.
+            cmd.args([
+                "-c",
+                "trap '' HUP; sleep 600 & printf 'CHILD_PID=%s\\n' \"$!\"; read answer; exit 7",
+            ]);
+            let mut shell = Pty::start(cmd).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let child: u32 = loop {
+                let text = shell.screen().unwrap().text;
+                if let Some(pid) = text.lines()
+                    .filter_map(|line| line.strip_prefix("CHILD_PID="))
+                    .find_map(|pid| pid.trim().parse().ok())
+                {
+                    break pid;
+                }
+                assert!(Instant::now() < deadline, "no background child: {text:?}");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let child_identity = crate::host_monitor::capture_identity(child).unwrap();
+            let _cleanup = Cleanup(child_identity);
+            shell.write("exit now\n").unwrap();
+            // Observe the natural exit without calling poll (which must retire the
+            // session). The zombie still reserves the leader PID/session identity.
+            while shell.root_exit_unreaped().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "the root did not exit naturally");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(crate::host_monitor::capture_identity(child), Some(child_identity));
+            assert!(!is_zombie(child as libc::pid_t), "hangup killed the fixture early");
+            match action {
+                "poll" => {
+                    assert_eq!(shell.poll().unwrap(), Some(7));
+                    assert_eq!(shell.poll().unwrap(), Some(7));
+                    shell.kill().unwrap();
+                }
+                "kill" => shell.kill().unwrap(),
+                "stop" => shell.stop().unwrap(),
+                "drop" => {}
+                _ => unreachable!(),
+            }
+            drop(shell);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::host_monitor::capture_identity(child) == Some(child_identity)
+                && !is_zombie(child as libc::pid_t)
+            {
+                assert!(Instant::now() < deadline, "{action} left the background child alive");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_or_failed_retirement_preserves_exit_and_unreaped_identity() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "exit 23"]);
+        let mut shell = Pty::start(cmd).unwrap();
+        let root = shell.process_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shell.root_exit_unreaped().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the fixture root never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Inject pending/failed membership checks around a real, naturally exited
+        // child. Each poll gets exactly one pass, never a bounded wait/retry loop.
+        let mut attempts = 0;
+        for expected in 1..=10 {
+            assert_eq!(shell.poll_unix(|pid| {
+                assert_eq!(pid, root);
+                attempts += 1;
+                Ok(false)
+            }).unwrap(), Some(23));
+            assert_eq!(attempts, expected);
+            assert!(!shell.retired && !shell.reaped);
+            assert_eq!(shell.root_exit_unreaped().unwrap(), Some(23), "pending retirement reaped its leader");
+        }
+        assert!(shell.poll_unix(|_| Err("membership unavailable".into())).is_err());
+        assert_eq!(shell.exit_code(), Some(23), "failed cleanup must not hide root exit");
+        assert!(!shell.retired && !shell.reaped);
+        assert_eq!(shell.root_exit_unreaped().unwrap(), Some(23));
+        // A later real pass verifies the empty session and only then reaps.
+        assert_eq!(shell.poll().unwrap(), Some(23));
+        assert!(shell.retired && shell.reaped);
+        assert_eq!(shell.poll().unwrap(), Some(23));
+        shell.kill().unwrap();
     }
 
     #[cfg(target_os = "linux")]

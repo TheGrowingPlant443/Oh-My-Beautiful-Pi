@@ -1,6 +1,20 @@
 import type { CommandOutput, CommandSummary, TerminalOwner } from "./api";
 import type { IParser } from "@xterm/xterm";
 
+// Blocking IPC runs on independent workers. Keep terminal operations in arrival order without
+// making a slow terminal hold up another one, and release settled queues rather than retaining IDs.
+export function createTerminalQueue(): (key: string, operation: () => Promise<void>) => Promise<void> {
+  const pending = new Map<string, Promise<void>>();
+  return (key, operation) => {
+    const result = (pending.get(key) ?? Promise.resolve()).then(operation);
+    // A failed operation still rejects its caller; it must not discard the input queued after it.
+    const settled = result.then(() => {}, () => {});
+    pending.set(key, settled);
+    void settled.then(() => { if (pending.get(key) === settled) pending.delete(key); });
+    return result;
+  };
+}
+
 // The PTY mirror owns these replies even before a view mounts; consume queries, never user input.
 export function registerBackendReplies(parser: IParser): () => void {
   const handlers = [

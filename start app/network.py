@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import stat
 import sys
 import threading
 from urllib.parse import urljoin, urlsplit
@@ -240,17 +241,29 @@ async def _resolve_public(host, port):
     return addresses[0]
 
 
+# Fixed absolute path: never a PATH-resolved binary on macOS.
+_KEYCHAIN = "/usr/bin/security"
+_PLATFORM = sys.platform
+
+
+def _keyring_command(target):
+    """(argv, inherited environment names) of the host credential lookup; the secret only appears on stdout."""
+    if _PLATFORM == "darwin":
+        # Exact service and account (the canonical origin): unrelated Keychain items never match.
+        return [_KEYCHAIN, "find-generic-password", "-s", "ombp-start", "-a", target, "-w"], ("HOME",)
+    return (["secret-tool", "lookup", "application", "ombp-start", "origin", target],
+            ("PATH", "HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"))
+
+
 async def _lookup_authorization(target):
-    environment = {name: os.environ[name] for name in
-                   ("PATH", "HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
-                   if name in os.environ}
+    command, inherited = _keyring_command(target)
+    environment = {name: os.environ[name] for name in inherited if name in os.environ}
     environment["LANG"] = "C.UTF-8"
     process = None
     try:
         async with asyncio.timeout(5):
             process = await asyncio.create_subprocess_exec(
-                "secret-tool", "lookup", "application", "ombp-start", "origin", target,
-                env=environment, stdout=asyncio.subprocess.PIPE,
+                *command, env=environment, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL, limit=16386)
             try:
                 await process.stdout.readexactly(16386)
@@ -497,6 +510,14 @@ class _Guard:
             data.server.error = "Website destination denied"
             self.policy.deny("website", target or _INVALID_ORIGIN, reason)
 
+    def server_connected(self, data):
+        # The socket is already connected to the vetted IP; peername stays pinned.
+        # Restore only the logical pool key, otherwise mitmproxy cannot reuse it
+        # for the hostname and request six waits behind five idle connections.
+        # Its public setter rejects any change while open, including this
+        # bookkeeping-only restoration; no socket or DNS operation occurs here.
+        object.__setattr__(data.server, "address", (data.server.sni, data.server.address[1]))
+
     def responseheaders(self, flow):
         if flow.response.status_code == 101 and not _websocket(flow):
             self._deny(flow, _origin(flow.request.scheme, flow.request.host,
@@ -601,13 +622,32 @@ async def relay(socket_path, port=18080):
         await server.serve_forever()
 
 
+_CERTIFICATES = re.compile(rb"\s*(?:-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\s*)+")
+
+
+def read_public_ca(path):
+    """The gateway's public CA as PEM certificates only; refuses links, foreign files and any key material."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_size > 65536:
+            raise ValueError("Proxy CA must be an owned regular file")
+        data = os.read(descriptor, 65537)
+    finally:
+        os.close(descriptor)
+    if len(data) > 65536 or not _CERTIFICATES.fullmatch(data):
+        raise ValueError("Proxy CA must contain only PEM certificates")
+    return data
+
+
 class NetworkGateway:
     """One gateway per launcher process (mitmproxy itself has process globals)."""
 
-    def __init__(self, policy, state_dir):
+    def __init__(self, policy, state_dir, socket_path=None):
+        """`socket_path` (default state_dir/socket/proxy.sock) may live in a short private directory instead."""
         self.policy = policy
         self.state_dir = Path(state_dir)
-        self.socket_path = self.state_dir / "socket" / "proxy.sock"
+        self.socket_path = Path(socket_path) if socket_path else self.state_dir / "socket" / "proxy.sock"
         self.ca_path = self.state_dir / "ca" / "mitmproxy-ca-cert.pem"
         self._thread = None
         self._master = None

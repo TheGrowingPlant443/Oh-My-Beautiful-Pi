@@ -17,8 +17,6 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Attribute value identifying every item this app stores.
@@ -26,8 +24,6 @@ const SERVICE: &str = "omp-manager.code-quality";
 /// An unlock prompt may legitimately wait for the user; anything longer is a hung service.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long a successful/failed check is reused by the non-blocking `status()`.
-const STATUS_TTL: Duration = Duration::from_secs(30);
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 /// Environment the Secret Service client needs to find the user's session bus; nothing else is inherited.
 const ENV_ALLOWLIST: &[&str] = &[
@@ -75,18 +71,17 @@ struct Output {
 
 #[derive(Default)]
 struct Cache {
-    checked: Option<(Instant, Result<()>)>,
+    checked: Option<Result<()>>,
 }
 
 struct Shared {
     backend: Backend,
     program: Result<PathBuf>,
     cache: Mutex<Cache>,
-    refreshing: AtomicBool,
 }
 
 pub struct ExternalSecrets {
-    shared: Arc<Shared>,
+    shared: Shared,
 }
 
 /// Looks `name` up in `search` (a PATH-style list), then in the fixed `extra` directories.
@@ -260,12 +255,11 @@ impl ExternalSecrets {
     #[must_use]
     pub(crate) fn with_program(backend: Backend, program: Result<PathBuf>) -> Self {
         Self {
-            shared: Arc::new(Shared {
+            shared: Shared {
                 backend,
                 program,
                 cache: Mutex::new(Cache::default()),
-                refreshing: AtomicBool::new(false),
-            }),
+            },
         }
     }
 }
@@ -318,7 +312,7 @@ impl Shared {
 
     fn verify_cached(&self) -> Result<()> {
         let result = self.probe();
-        self.cache.lock().checked = Some((Instant::now(), result.clone()));
+        self.cache.lock().checked = Some(result.clone());
         result
     }
 }
@@ -327,10 +321,6 @@ impl SecretStore for ExternalSecrets {
     fn status(&self) -> CredentialStoreStatus {
         let name = self.shared.backend.display().to_string();
         let cached = self.shared.cache.lock().checked.clone();
-        let stale = cached
-            .as_ref()
-            .map(|(at, _)| at.elapsed() >= STATUS_TTL)
-            .unwrap_or(true);
         if let Err(message) = &self.shared.program {
             // Nothing to probe: the answer is already final and free.
             return CredentialStoreStatus {
@@ -339,32 +329,20 @@ impl SecretStore for ExternalSecrets {
                 message: Some(message.clone()),
             };
         }
-        if stale && !self.shared.refreshing.swap(true, Ordering::AcqRel) {
-            let shared = self.shared.clone();
-            let spawned = std::thread::Builder::new()
-                .name("code-quality-secret-probe".into())
-                .spawn(move || {
-                    let _ = shared.verify_cached();
-                    shared.refreshing.store(false, Ordering::Release);
-                });
-            if spawned.is_err() {
-                self.shared.refreshing.store(false, Ordering::Release);
-            }
-        }
         match cached {
-            // Until the first background check lands the store is presumed usable; `verify()` is
-            // authoritative and runs before anything is stored.
+            // Only tracked service workers or explicit credential operations probe the store.
+            // Presence remains unchecked until that work completes; polling never prompts.
             None => CredentialStoreStatus {
                 name,
                 available: true,
                 message: None,
             },
-            Some((_, Ok(()))) => CredentialStoreStatus {
+            Some(Ok(())) => CredentialStoreStatus {
                 name,
                 available: true,
                 message: None,
             },
-            Some((_, Err(message))) => CredentialStoreStatus {
+            Some(Err(message)) => CredentialStoreStatus {
                 name,
                 available: false,
                 message: Some(message),
@@ -600,6 +578,22 @@ esac
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn polling_status_only_reads_the_cache_and_never_starts_a_probe() {
+        let fake = Fake::new("ok");
+        let store = fake.store();
+        for _ in 0..3 {
+            assert!(store.status().available);
+        }
+        assert!(store.shared.cache.lock().checked.is_none());
+        assert!(fake.log("argv.log").is_empty());
+        store.verify().unwrap();
+        let checked = fake.log("argv.log");
+        assert_eq!(checked.lines().count(), 1);
+        assert!(store.status().available);
+        assert_eq!(fake.log("argv.log"), checked);
     }
 
     #[test]

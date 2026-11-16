@@ -103,3 +103,45 @@ test("seeded positions are deterministic and distinct, and invalid jobs are reje
   await assert.rejects(core.runLayout({ seeds: new Float32Array(4), edges: Uint32Array.from([0, 5]), iterations: 1 }, { cancelled: () => false, yieldNow: async () => {} }), /does not exist/);
   assert.equal((await core.runLayout({ seeds: new Float32Array(0), edges: new Uint32Array(0), iterations: 5 }, { cancelled: () => false, yieldNow: async () => {} })).length, 0);
 });
+
+test("a large dependency graph keeps every node and edge when handed to the worker", async () => {
+  // More than the scanner's package limit: neither worker transport nor rendering may silently take a prefix.
+  const ids = Array.from({ length: 30_001 }, (_, index) => `npm:package-${index}`);
+  const edges = ids.slice(1).flatMap((id, index) => [[ids[index], id], [id, ids[0]]]);
+  const worker = { onmessage: null, onerror: null, sent: [], terminated: false,
+    postMessage(message) { this.sent.push(message); },
+    terminate() { this.terminated = true; },
+  };
+  const client = new LayoutClient(() => worker);
+  const pending = client.run({ ids, edges, iterations: 50 });
+  const message = worker.sent[0];
+  assert.equal(message.seeds.length, ids.length * 2);
+  assert.equal(message.edges.length, edges.length * 2);
+  assert.deepEqual(Array.from(message.edges.slice(-4)), [29_999, 30_000, 30_000, 0]);
+  worker.onmessage({ data: { type: "done", version: message.version, jobId: message.jobId, positions: message.seeds } });
+  assert.deepEqual((await pending).ids, ids);
+  client.dispose();
+  assert.equal(worker.terminated, true);
+});
+
+test("large cyclic dependency layouts yield and can be cancelled before publishing positions", async () => {
+  const count = 2_101;
+  const seeds = new Float32Array(count * 2);
+  const edges = new Uint32Array(count * 2);
+  for (let index = 0; index < count; index++) {
+    const position = core.seededPosition(`npm:${index}`, index);
+    seeds[index * 2] = position.x;
+    seeds[index * 2 + 1] = position.y;
+    edges[index * 2] = index;
+    edges[index * 2 + 1] = (index + 1) % count;
+  }
+  let cancelled = false, yielded = 0, published = 0;
+  const result = await core.runLayout({ seeds, edges, iterations: 500 }, {
+    cancelled: () => cancelled,
+    yieldNow: async () => { yielded++; cancelled = true; },
+    progress: () => published++,
+  });
+  assert.equal(result, null);
+  assert.equal(yielded, 1);
+  assert.equal(published, 0);
+});

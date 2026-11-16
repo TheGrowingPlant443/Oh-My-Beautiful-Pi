@@ -23,8 +23,9 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| e.to_string())?
 }
 #[tauri::command]
-pub fn list_instances(state: State<'_, AppState>) -> Vec<Instance> {
-    state.registry.snapshot()
+pub async fn list_instances(state: State<'_, AppState>) -> Result<Vec<Instance>> {
+    let registry = state.registry.clone();
+    blocking(move || Ok(registry.snapshot())).await
 }
 #[tauri::command]
 pub async fn ensure_coordinators(
@@ -57,8 +58,9 @@ pub async fn configure_browser(
     blocking(move || browser.configure(settings)).await
 }
 #[tauri::command]
-pub fn list_browsers(state: State<'_, AppState>) -> Vec<crate::browser::BrowserInfo> {
-    state.browser.snapshot()
+pub async fn list_browsers(state: State<'_, AppState>) -> Result<Vec<crate::browser::BrowserInfo>> {
+    let browser = state.browser.clone();
+    blocking(move || Ok(browser.snapshot())).await
 }
 #[tauri::command]
 pub async fn open_session_browser(
@@ -135,38 +137,50 @@ pub fn set_browser_view(
     Ok(())
 }
 #[tauri::command]
-pub fn create_instance(
+pub async fn create_instance(
     app: AppHandle,
     state: State<'_, AppState>,
     config: CreateInput,
 ) -> Result<Instance> {
-    let instance = state.registry.create(config)?;
-    publish(&app, &state.registry);
-    Ok(instance)
+    let registry = state.registry.clone();
+    blocking(move || {
+        let instance = registry.create(config)?;
+        publish(&app, &registry);
+        Ok(instance)
+    })
+    .await
 }
 #[tauri::command]
-pub fn create_manager(
+pub async fn create_manager(
     app: AppHandle,
     state: State<'_, AppState>,
     config: CreateInput,
 ) -> Result<Instance> {
-    let instance = state.registry.create_manager(config)?;
-    let result = state.registry.start(&instance.id, Origin::Human);
-    publish(&app, &state.registry);
-    result?;
-    state.registry.inspect(&instance.id, Origin::Human)
+    let registry = state.registry.clone();
+    blocking(move || {
+        let instance = registry.create_manager(config)?;
+        let result = registry.start(&instance.id, Origin::Human);
+        publish(&app, &registry);
+        result?;
+        registry.inspect(&instance.id, Origin::Human)
+    })
+    .await
 }
 #[tauri::command]
-pub fn create_architect(
+pub async fn create_architect(
     app: AppHandle,
     state: State<'_, AppState>,
     config: CreateInput,
 ) -> Result<Instance> {
-    let instance = state.registry.create_architect(config)?;
-    let result = state.registry.start(&instance.id, Origin::Human);
-    publish(&app, &state.registry);
-    result?;
-    state.registry.inspect(&instance.id, Origin::Human)
+    let registry = state.registry.clone();
+    blocking(move || {
+        let instance = registry.create_architect(config)?;
+        let result = registry.start(&instance.id, Origin::Human);
+        publish(&app, &registry);
+        result?;
+        registry.inspect(&instance.id, Origin::Human)
+    })
+    .await
 }
 #[tauri::command]
 pub async fn scan_dependencies(
@@ -848,7 +862,7 @@ pub async fn confirm_dependency_update_handoff(
     .await
 }
 #[tauri::command]
-pub fn change_agent_directory(
+pub async fn change_agent_directory(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     id: String,
@@ -858,22 +872,22 @@ pub fn change_agent_directory(
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state
-        .workspace
-        .change_directory(id, folder, expected_generation)
+    let workspace = state.workspace.clone();
+    blocking(move || workspace.change_directory(id, folder, expected_generation)).await
 }
 #[tauri::command]
-pub fn list_computed_workspace_folders(
+pub async fn list_computed_workspace_folders(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>> {
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state.workspace.computed_folders()
+    let workspace = state.workspace.clone();
+    blocking(move || workspace.computed_folders()).await
 }
 #[tauri::command]
-pub fn hand_over_to_manager(
+pub async fn hand_over_to_manager(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     source_id: String,
@@ -881,10 +895,11 @@ pub fn hand_over_to_manager(
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state.workspace.hand_over_to_manager(source_id)
+    let workspace = state.workspace.clone();
+    blocking(move || workspace.hand_over_to_manager(source_id)).await
 }
 #[tauri::command]
-pub fn take_back_control(
+pub async fn take_back_control(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     id: String,
@@ -892,10 +907,11 @@ pub fn take_back_control(
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state.workspace.take_back_control(&id)
+    let workspace = state.workspace.clone();
+    blocking(move || workspace.take_back_control(&id)).await
 }
 #[tauri::command]
-pub fn return_to_manager(
+pub async fn return_to_manager(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     id: String,
@@ -904,10 +920,11 @@ pub fn return_to_manager(
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state.workspace.return_to_manager(id, human_request_id)
+    let workspace = state.workspace.clone();
+    blocking(move || workspace.return_to_manager(id, human_request_id)).await
 }
 #[tauri::command]
-pub fn give_repo_to_architect(
+pub async fn give_repo_to_architect(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     source_id: String,
@@ -915,30 +932,34 @@ pub fn give_repo_to_architect(
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state.workspace.give_repo_to_architect(source_id)
+    let workspace = state.workspace.clone();
+    blocking(move || workspace.give_repo_to_architect(source_id)).await
 }
 #[tauri::command]
-pub fn list_workspace_changes(
+pub async fn list_workspace_changes(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::workspace::WorkspaceChange>> {
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    Ok(state.workspace.list())
+    let workspace = state.workspace.clone();
+    blocking(move || Ok(workspace.list())).await
 }
 #[tauri::command]
-pub fn start_instance(
+pub async fn start_instance(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     fresh: Option<bool>,
 ) -> Result<()> {
-    let result = state
-        .registry
-        .start_with(&id, Origin::Human, fresh.unwrap_or(false));
-    publish(&app, &state.registry);
-    result
+    let registry = state.registry.clone();
+    blocking(move || {
+        let result = registry.start_with(&id, Origin::Human, fresh.unwrap_or(false));
+        publish(&app, &registry);
+        result
+    })
+    .await
 }
 #[tauri::command]
 pub async fn stop_instance(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<()> {
@@ -977,20 +998,23 @@ pub async fn remove_instance(app: AppHandle, state: State<'_, AppState>, id: Str
     .await
 }
 #[tauri::command]
-pub fn attach_pty(
+pub async fn attach_pty(
     state: State<'_, AppState>,
     id: String,
     on_data: Channel<InvokeResponseBody>,
 ) -> Result<()> {
-    state.registry.attach(&id, on_data)
+    let registry = state.registry.clone();
+    blocking(move || registry.attach(&id, on_data)).await
 }
 #[tauri::command]
-pub fn write_pty(state: State<'_, AppState>, id: String, data: String) -> Result<()> {
-    state.registry.write(&id, &data, Origin::Human)
+pub async fn write_pty(state: State<'_, AppState>, id: String, data: String) -> Result<()> {
+    let registry = state.registry.clone();
+    blocking(move || registry.write(&id, &data, Origin::Human)).await
 }
 #[tauri::command]
-pub fn resize_pty(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> Result<()> {
-    state.registry.resize(&id, cols, rows, Origin::Human)
+pub async fn resize_pty(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> Result<()> {
+    let registry = state.registry.clone();
+    blocking(move || registry.resize(&id, cols, rows, Origin::Human)).await
 }
 #[tauri::command]
 pub async fn get_source_index(
@@ -1155,7 +1179,7 @@ pub async fn read_terminal_output(
     blocking(move || terminals.read_output(&id, &session_id, &execution_id)).await
 }
 #[tauri::command]
-pub fn attach_command_output(
+pub async fn attach_command_output(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     id: String,
@@ -1167,9 +1191,11 @@ pub fn attach_command_output(
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state
-        .terminals
-        .attach_output(&id, generation, &session_id, &execution_id, on_data)
+    let terminals = state.terminals.clone();
+    blocking(move || {
+        terminals.attach_output(&id, generation, &session_id, &execution_id, on_data)
+    })
+    .await
 }
 #[tauri::command]
 pub async fn kill_terminal_command(
@@ -1199,7 +1225,7 @@ pub async fn open_user_terminal(
     blocking(move || terminals.open_user_shell(&id)).await
 }
 #[tauri::command]
-pub fn attach_user_terminal(
+pub async fn attach_user_terminal(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     id: String,
@@ -1209,10 +1235,11 @@ pub fn attach_user_terminal(
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state.terminals.attach_user_shell(&id, &shell_id, on_data)
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.attach_user_shell(&id, &shell_id, on_data)).await
 }
 #[tauri::command]
-pub fn write_user_terminal(
+pub async fn write_user_terminal(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     id: String,
@@ -1222,10 +1249,11 @@ pub fn write_user_terminal(
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state.terminals.write_user_shell(&id, &shell_id, &data)
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.write_user_shell(&id, &shell_id, &data)).await
 }
 #[tauri::command]
-pub fn resize_user_terminal(
+pub async fn resize_user_terminal(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     id: String,
@@ -1236,9 +1264,8 @@ pub fn resize_user_terminal(
     if window.label() != "main" {
         return Err("unauthorized window".into());
     }
-    state
-        .terminals
-        .resize_user_shell(&id, &shell_id, cols, rows)
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.resize_user_shell(&id, &shell_id, cols, rows)).await
 }
 #[tauri::command]
 pub async fn close_user_terminal(
@@ -1254,24 +1281,30 @@ pub async fn close_user_terminal(
     blocking(move || terminals.close_user_shell(&id, &shell_id)).await
 }
 #[tauri::command]
-pub fn list_sessions(
+pub async fn list_sessions(
     state: State<'_, AppState>,
     project_path: String,
     profile: String,
-) -> Vec<session::SessionInfo> {
-    session::list(&state.registry.home, Path::new(&project_path), &profile)
+) -> Result<Vec<session::SessionInfo>> {
+    let registry = state.registry.clone();
+    blocking(move || Ok(session::list(&registry.home, Path::new(&project_path), &profile))).await
 }
 #[tauri::command]
-pub fn read_plan(state: State<'_, AppState>, id: String) -> Result<Option<String>> {
-    state.registry.plan(&id, Origin::Human)
+pub async fn read_plan(state: State<'_, AppState>, id: String) -> Result<Option<String>> {
+    let registry = state.registry.clone();
+    blocking(move || registry.plan(&id, Origin::Human)).await
 }
 #[tauri::command]
-pub fn list_plan_backups(
+pub async fn list_plan_backups(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<crate::plan::PlanBackup>> {
-    state.registry.inspect(&id, Origin::Human)?;
-    crate::plan::list_backups(&state.registry.plan_folder(&id))
+    let registry = state.registry.clone();
+    blocking(move || {
+        registry.inspect(&id, Origin::Human)?;
+        crate::plan::list_backups(&registry.plan_folder(&id))
+    })
+    .await
 }
 #[tauri::command]
 pub async fn restore_plan_backup(
@@ -1314,8 +1347,9 @@ pub async fn render_transcript(
     .await
 }
 #[tauri::command]
-pub fn get_global_config(state: State<'_, AppState>) -> crate::config::GlobalConfigInfo {
-    state.registry.global_config.info()
+pub async fn get_global_config(state: State<'_, AppState>) -> Result<crate::config::GlobalConfigInfo> {
+    let registry = state.registry.clone();
+    blocking(move || Ok(registry.global_config.info())).await
 }
 #[tauri::command]
 pub async fn preview_global_config(

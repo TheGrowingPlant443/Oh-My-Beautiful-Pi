@@ -727,7 +727,7 @@ pub(crate) struct Row {
     pub pid: u32,
     pub created: u64,
     pub exe: String,
-    pub cmd: String,
+    pub argv: Vec<String>,
 }
 
 #[cfg(unix)]
@@ -783,11 +783,11 @@ fn query_processes() -> Result<Vec<Row>, String> {
                     .and_then(|value| value.as_str())
                     .unwrap_or_default()
                     .to_string(),
-                cmd: item
-                    .get("cmd")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                argv: components::split_command_line(
+                    item.get("cmd")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                ),
             })
         })
         .collect())
@@ -821,13 +821,12 @@ pub(crate) fn verify_backends(
 ) -> Vec<Backend> {
     let mut verified = Vec::new();
     for row in rows {
-        let tokens = components::split_command_line(&row.cmd);
-        let Some(program) = tokens.first() else {
+        let Some(program) = row.argv.first() else {
             continue;
         };
         let installed = launched_from_venv(program, &row.exe, venv_python);
         let Some(port) = installed
-            .then(|| components::uvicorn_port(&tokens))
+            .then(|| components::uvicorn_port(&row.argv))
             .flatten()
         else {
             continue;

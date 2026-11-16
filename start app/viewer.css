@@ -1,0 +1,6 @@
+html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+#screen { position: fixed; inset: 0; }
+#status { position: fixed; left: 50%; top: 1rem; transform: translateX(-50%); padding: .5rem .9rem;
+  border-radius: .4rem; background: rgba(20, 20, 20, .9); color: #eee; font: 14px system-ui, sans-serif; }
+#status[hidden] { display: none; }
+#status button { margin-left: .5rem; font: inherit; }

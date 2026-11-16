@@ -1242,7 +1242,16 @@ impl CodeQualityService {
         };
         let port = target.community_port;
         let db_hash = spec_hash(&[postgres, "db", "512m", "1"]);
-        let sonar_hash = spec_hash(&[sonarqube, "sonar", &port.to_string(), "4g", "2", postgres]);
+        // "offline" recreates containers made before telemetry and update checks were switched off.
+        let sonar_hash = spec_hash(&[
+            sonarqube,
+            "sonar",
+            &port.to_string(),
+            "4g",
+            "2",
+            postgres,
+            "offline",
+        ]);
         let labels = |role: &str, hash: &str| {
             vec![
                 (OWNER_LABEL.to_string(), installation.clone()),
@@ -1276,6 +1285,9 @@ impl CodeQualityService {
                     format!("jdbc:postgresql://{DB_ALIAS}:5432/sonar"),
                 ),
                 ("SONAR_JDBC_USERNAME".into(), "sonar".into()),
+                // The managed server never reports usage statistics or contacts SonarSource's update centre.
+                ("SONAR_TELEMETRY_ENABLE".into(), "false".into()),
+                ("SONAR_UPDATECENTER_ACTIVATE".into(), "false".into()),
             ],
             secret_env: vec![("SONAR_JDBC_PASSWORD".into(), password)],
             network: Some(n.network),

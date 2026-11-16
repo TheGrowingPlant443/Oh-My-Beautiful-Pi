@@ -36,6 +36,7 @@ const credentialContents = [
 const credentialStores = [
   /^(?:\.env(?:\..*)?|\.ssh|\.gnupg|\.docker|\.npmrc|\.pypirc|\.netrc|\.git-credentials)$/i,
   /^(?:\.yarnrc(?:\.yml)?|auth\.(?:json|ya?ml)|token|hosts\.yml)$/i,
+  /^antigravity-oauth-token(?:\.[^/]*)?$/i,
   /^\.?credentials?(?:\.[^/]*)?$/i,
   /^id_(?:rsa|dsa|ecdsa|ed25519)$/i,
   /^.*\.(?:pem|key|p12|pfx|kdbx)$/i,
@@ -43,7 +44,7 @@ const credentialStores = [
 const credentialStore = part => credentialStores.some(pattern => pattern.test(part));
 const ordinal = (a, b) => (a < b ? -1 : Number(a > b));
 const excludedRoots = new Set(['extensions', 'hooks', 'customtools', 'mcp', 'telemetry', 'auth', 'shellpath']);
-const excludedSettings = new Set(['skills.customDirectories']);
+const excludedSettings = new Set(['skills.customDirectories', 'systemPromptTemplates', 'browser.webkitPath', 'ovnfs.path']);
 
 function record(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);

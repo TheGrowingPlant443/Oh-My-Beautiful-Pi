@@ -63,6 +63,13 @@ test('native custom skill paths cannot bypass reviewed copied assets', () => {
   assert.equal(JSON.stringify(result).includes('/outside/unreviewed'), false);
 });
 
+test('native executable and instruction paths cannot bypass reviewed portable assets', () => {
+  const settings = [...definitions, ...['browser.webkitPath', 'ovnfs.path', 'systemPromptTemplates'].map(id => ({ id, segments: id.split('.') }))];
+  const result = sanitizeConfig({ theme: 'dark', browser: { webkitPath: '/unreviewed/ABHost' }, ovnfs: { path: '/unreviewed/ovnfs' }, systemPromptTemplates: { '*': '/unreviewed/prompt.md' } }, settings);
+  assert.deepEqual({ ...result.settings }, { theme: 'dark' });
+  assert.deepEqual(result.omitted, ['browser.webkitPath', 'ovnfs.path', 'systemPromptTemplates']);
+});
+
 test('safe UTF-8 skill/rule assets are lossless and executable content is review-gated', () => {
   const assets = [
     { path: 'AGENTS.md', content: '\uFEFF# Æble 🍎\r\nUse local models.\r\n' },
@@ -242,10 +249,13 @@ test('known credential stores and recognizable secret-bearing binary files are n
   await fs.writeFile(path.join(root, 'skills/demo/.netrc'), 'machine example.test login user password DO_NOT_EXPORT');
   await fs.writeFile(path.join(root, 'skills/demo/.npmrc'), '//example.test/:_authToken=DO_NOT_EXPORT');
   await fs.writeFile(path.join(root, 'skills/demo/data.bin'), Buffer.concat([Buffer.from([0xff, 0x00]), Buffer.from('API_TOKEN=DO_NOT_EXPORT')]));
+  await fs.writeFile(path.join(root, 'skills/demo/antigravity-oauth-token'), Buffer.from([0xff, 0x00, 0xa5]));
+  await fs.writeFile(path.join(root, 'skills/demo/antigravity-oauth-token.staging.tmp'), Buffer.from([0xff, 0x00, 0xa5]));
   const cleaned = sanitizeAssets((await readBundle(root)).assets);
   assert.equal(cleaned.assets.length, 0);
   assert.equal(JSON.stringify(cleaned).includes('DO_NOT_EXPORT'), false);
   assert.ok(cleaned.omitted.length);
+  assert.ok(cleaned.omitted.some(item => item.startsWith('skills/demo/antigravity-oauth-token:')));
 });
 
 test('native folders and portable manifests roundtrip exact assets and meaningful names', async t => {
@@ -350,6 +360,9 @@ test('installed native settings parser roundtrips reviewed folder assets without
   const preview = invoke({ action: 'import', path: native, name: 'Daily native setup' });
   assert.equal(preview.name, 'Daily native setup');
   assert.equal(preview.modelRoles.default, 'ollama/local');
+  const executablePaths = invoke({ action: 'import', yaml: 'temperature: 0.2\nbrowser:\n  webkitPath: /unreviewed/ABHost\novnfs:\n  path: /unreviewed/ovnfs\nsystemPromptTemplates:\n  "*": /unreviewed/prompt.md\n' });
+  assert.deepEqual(executablePaths.omitted, ['browser.webkitPath', 'ovnfs.path', 'systemPromptTemplates']);
+  assert.doesNotMatch(executablePaths.yaml, /unreviewed|webkitPath|ovnfs|systemPromptTemplates/);
   await fs.unlink(path.join(native, 'config.yml'));
   const assetsOnly = invoke({ action: 'import', path: native });
   assert.deepEqual(assetsOnly.modelRoles, {});

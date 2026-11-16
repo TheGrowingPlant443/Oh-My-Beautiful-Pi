@@ -5,6 +5,7 @@ never receives this channel, its keys or the host's control token.
 
   ombp-guest                        control session: framed JSON on stdin/stdout
   ombp-guest receive-snapshot ID    extract one source snapshot (a tar stream on stdin) into the build area
+  ombp-guest receive-omp-copy TOKEN stage a full private ~/.omp tar; only its owning control session can publish it
   ombp-guest await-forwards         report once the host's reverse-forwarded sockets exist, then hold until EOF
   ombp-guest provision-emulation    root-only fixed provisioning of the owned guest's pinned static interpreter
 
@@ -16,6 +17,7 @@ requirement choices, reports denials, and cannot grant anything itself.
 import copy
 import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -23,6 +25,7 @@ import platform
 import queue
 import re
 import resource
+import secrets
 import shutil
 import signal
 import socket
@@ -38,8 +41,9 @@ sys.path.insert(0, str(LAUNCHER))
 
 from catalog import host_program, installed_programs  # noqa: E402
 from file_broker import ProtocolError, RemoteHostFiles, encode_frame, read_frame  # noqa: E402
+from omp_copy import copy_status, install_snapshot  # noqa: E402
 from packages import validate_packages  # noqa: E402
-from policy import nix_program  # noqa: E402
+from policy import KEYBOARD_LAYOUTS, nix_program  # noqa: E402
 from requirements import FOLDERS  # noqa: E402
 from runtime import NIX, STORE, Cancelled, OwnedChildren, step  # noqa: E402
 
@@ -55,11 +59,12 @@ LOCK_WAIT = 10
 
 
 def installation_settings(value):
-    """The host's captured {installed_mode, selected_packages}, revalidated for this guest's Linux system."""
-    if (not isinstance(value, dict) or set(value) != {"installed_mode", "selected_packages"}
-            or not isinstance(value["installed_mode"], bool)):
+    """The host's captured installation choice, revalidated for this guest's Linux system."""
+    if (not isinstance(value, dict) or set(value) != {"installed_mode", "selected_packages", "keyboard_layout"}
+            or not isinstance(value["installed_mode"], bool) or value["keyboard_layout"] not in KEYBOARD_LAYOUTS):
         raise ValueError("Invalid installation settings")
-    return {"installed_mode": value["installed_mode"], "selected_packages": validate_packages(value["selected_packages"])}
+    return {"installed_mode": value["installed_mode"], "selected_packages": validate_packages(value["selected_packages"]),
+            "keyboard_layout": value["keyboard_layout"]}
 
 
 def discovery_home(value):
@@ -224,8 +229,13 @@ def requirements(policy):
     manifest = policy.directory / "requirements.json"
     items = json.loads(manifest.read_text()) if manifest.exists() else [
         {"id": key, "label": label, "path": path, "kind": "folder"} for key, label, path in FOLDERS]
+    copy_row = next({"id": key, "label": label, "path": path, "kind": "folder"}
+                    for key, label, path in FOLDERS if key == "omp-copy")
+    items = [copy_row if item["id"] in ("host-omp", "omp-copy") else item for item in items]
+    if not any(item["id"] == "omp-copy" for item in items):
+        items.append(copy_row)
     disabled = set(policy.snapshot()["disabled_requirements"])
-    return [{**item, "enabled": item["id"] not in disabled} for item in items]
+    return [{**item, "enabled": item["id"] == "omp-copy" or item["id"] not in disabled} for item in items]
 
 
 # Source snapshots -------------------------------------------------------------------------------------------------
@@ -341,6 +351,36 @@ def receive_snapshot(layout, snapshot_id, stream):
         if old.name != snapshot_id:
             shutil.rmtree(old, ignore_errors=True)
 
+def receive_omp_copy(layout, token, stream):
+    """Stage bytes only. A receiver can never publish, even if its SSH session outlives the controller."""
+    if not isinstance(token, str) or not _SNAPSHOT_ID.fullmatch(token):
+        raise ValueError("Invalid private-copy token")
+    directory = layout.root / f"omp-incoming-{token}"
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise ValueError("Unsafe private-copy staging directory")
+        fd = os.open("partial", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=descriptor)
+        with os.fdopen(fd, "wb") as output:
+            shutil.copyfileobj(stream, output, 1 << 20)
+        os.rename("partial", "received", src_dir_fd=descriptor, dst_dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+
+
+class OmpCopy:
+    def __init__(self, layout, replace, request_id):
+        self.token = secrets.token_hex(16)
+        self.directory = layout.root / f"omp-incoming-{self.token}"
+        self.directory.mkdir(mode=0o700)
+        self.replace = replace
+        self.request_id = request_id
+        self.cancelled = threading.Event()
+        self.installing = False
+
+
 
 # Control session --------------------------------------------------------------------------------------------------
 
@@ -367,6 +407,8 @@ class Supervisor:
         self.run = None
         self.runs = 0
         self.phase = "idle"
+        self.omp_copy = None
+        self.keyring_backend = None  # Set by recovery before the control channel announces readiness.
         self.log_read, self.log_write = os.pipe()
         self.log = os.fdopen(self.log_write, "ab", buffering=0)
         self.management_children = OwnedChildren()
@@ -374,19 +416,27 @@ class Supervisor:
         self.log_thread.start()
         self.handlers = {"catalog": self.catalog, "resolve_program": self.resolve_program,
                          "resolve_closure": self.resolve_closure, "requirements": self.requirements,
-                         "start": self.start, "stop": self.stop, "status": self.status, "policy": self.apply_policy}
+                         "start": self.start, "stop": self.stop, "status": self.status, "policy": self.apply_policy,
+                         "omp_copy_status": self.omp_copy_status, "omp_copy_begin": self.omp_copy_begin,
+                         "omp_copy_commit": self.omp_copy_commit, "omp_copy_cancel": self.omp_copy_cancel}
 
     def emit(self, event):
         self.channel.send(event)
 
     def _forward_log(self):
-        """Every guest build/container log byte goes to the guest log and, as bounded events, to the host log."""
+        """Every guest build/container log byte goes to the guest log and, as bounded events, to the host log.
+
+        The drain outlives a failing guest log (a full disk): builders block forever on this pipe otherwise.
+        """
         with open(self.layout.log, "ab", buffering=0) as output:
             while True:
                 data = os.read(self.log_read, LOG_CHUNK)
                 if not data:
                     return
-                output.write(data)
+                try:
+                    output.write(data)
+                except OSError:
+                    pass  # The host log below still receives every byte.
                 self.emit({"event": "log", "text": data.decode("utf-8", "replace")})
 
     # Actions; each returns a JSON result or raises ValueError/RuntimeError/OSError with a user-facing message.
@@ -415,6 +465,82 @@ class Supervisor:
             return {"phase": self.phase, "run": run.generation if run else None, "system": SYSTEM,
                     "applied_policy_generation": self.policy.generation,
                     "forwards": {"proxy": str(self.layout.proxy_socket), "broker": str(self.layout.broker_socket)}}
+
+    def omp_copy_status(self, args):
+        self._args(args, ())
+        return copy_status(self.layout.state)
+
+    def omp_copy_begin(self, args):
+        self._args(args, ("replace", "request_id", "keyring_unlock"))
+        if type(args["replace"]) is not bool:
+            raise ValueError("Invalid private-copy authorization")
+        request_id = args["request_id"]
+        if args["replace"]:
+            if not isinstance(request_id, str) or not _SNAPSHOT_ID.fullmatch(request_id):
+                raise ValueError("Invalid private-copy request ID")
+        elif request_id is not None:
+            raise ValueError("A private-copy request ID requires replacement authorization")
+        with self.lock:
+            if self.run is not None or self.phase != "idle":
+                raise ValueError("A private copy requires an idle guest")
+            # Initialize the host-delivered unlock verifier before a first copy makes the guest home nonempty.
+            # Existing homes still require their original verifier/key.
+            self.keyring_backend._keyring_password(args["keyring_unlock"])
+            transfer = OmpCopy(self.layout, args["replace"], request_id)
+            self.omp_copy = transfer
+            self.phase = "copying"
+            return {"token": transfer.token}
+
+    def _copy_check(self, transfer):
+        if transfer.cancelled.is_set() or self.omp_copy is not transfer:
+            raise Cancelled("Private copy cancelled")
+
+    def _copy_cleanup(self, transfer):
+        shutil.rmtree(transfer.directory, ignore_errors=True)
+        with self.lock:
+            if self.omp_copy is transfer:
+                self.omp_copy = None
+                self.phase = "idle"
+
+    def omp_copy_cancel(self, args):
+        self._args(args, ("token",))
+        with self.lock:
+            transfer = self.omp_copy
+            if transfer is None or transfer.token != args["token"]:
+                return {"cancelled": False}
+            transfer.cancelled.set()
+            installing = transfer.installing
+        if not installing:
+            self._copy_cleanup(transfer)
+        return {"cancelled": True}
+
+    def omp_copy_commit(self, args):
+        self._args(args, ("token", "digest"))
+        if not isinstance(args["digest"], str) or not re.fullmatch(r"[0-9a-f]{64}", args["digest"]):
+            raise ValueError("Invalid private-copy digest")
+        with self.lock:
+            transfer = self.omp_copy
+            if (transfer is None or transfer.token != args["token"] or transfer.installing
+                    or self.run is not None or self.phase != "copying"):
+                raise ValueError("Private-copy session is no longer owned")
+            self._copy_check(transfer)
+            transfer.installing = True
+        try:
+            fd = os.open(transfer.directory / "received", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("Invalid private-copy archive")
+                digest = hashlib.sha256()
+                while chunk := stream.read(1 << 20):
+                    self._copy_check(transfer)
+                    digest.update(chunk)
+                if digest.hexdigest() != args["digest"]:
+                    raise ValueError("Private-copy transport was incomplete")
+                stream.seek(0)
+                return install_snapshot(stream, self.layout.state, replace=transfer.replace,
+                                        request_id=transfer.request_id, check=lambda: self._copy_check(transfer))
+        finally:
+            self._copy_cleanup(transfer)
 
     def apply_policy(self, args):
         self._args(args, ("generation", "projection"))
@@ -510,7 +636,8 @@ class Supervisor:
             from vm_display import HeadlessDisplays
             run.files = RemoteHostFiles.connect(self.layout.broker_socket)
             displays = HeadlessDisplays(root=self.layout.state / "display",
-                                        emit=lambda event: self.emit({**event, "run": run.generation}))
+                                        emit=lambda event: self.emit({**event, "run": run.generation}),
+                                        keyboard=run.args["installation"]["keyboard_layout"])
             # Constructing retires any leftover container (slow); never under the status lock.
             step(self.log, "Preparing container runtime")
             run.backend = ContainerBackend(self.policy, host_files=run.files, external_network=True,
@@ -556,6 +683,10 @@ class Supervisor:
 
     def cancel(self):
         with self.lock:
+            transfer = self.omp_copy
+        if transfer is not None:
+            self.omp_copy_cancel({"token": transfer.token})
+        with self.lock:
             run = self.run
             if run is None:
                 return None
@@ -587,7 +718,7 @@ class Supervisor:
                 message = self.channel.read()
                 if message is None:
                     break
-                if message.get("action") in ("catalog", "resolve_program", "resolve_closure"):
+                if message.get("action") in ("catalog", "resolve_program", "resolve_closure", "omp_copy_commit"):
                     try:
                         slow.put_nowait(message)
                     except queue.Full:
@@ -686,6 +817,7 @@ def _retire_leftovers(policy):
     backend = ContainerBackend(policy, external_network=True)
     backend.stop()
     retire_engine_sockets(policy.directory)
+    return backend
 
 
 def prepare_descriptor_limit():
@@ -713,7 +845,7 @@ def serve_control():
     lock = _lock(layout)
     try:
         supervisor = Supervisor(channel, layout)
-        _retire_leftovers(supervisor.policy)
+        supervisor.keyring_backend = _retire_leftovers(supervisor.policy)
         channel.send({"event": "hello", "system": SYSTEM, "pid": os.getpid()})
         supervisor.serve()
     finally:
@@ -769,6 +901,14 @@ def main(argv):
             receive_snapshot(layout, argv[1], sys.stdin.buffer)
         except (ValueError, OSError, tarfile.TarError) as failure:
             print(f"Source snapshot rejected: {failure}", file=sys.stderr)
+            return 1
+        print("ok", flush=True)
+        return 0
+    if len(argv) == 2 and argv[0] == "receive-omp-copy":
+        try:
+            receive_omp_copy(Layout(), argv[1], sys.stdin.buffer)
+        except (ValueError, OSError):
+            print("Private ~/.omp transport rejected", file=sys.stderr)
             return 1
         print("ok", flush=True)
         return 0

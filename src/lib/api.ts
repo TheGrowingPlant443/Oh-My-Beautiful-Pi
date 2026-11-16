@@ -71,19 +71,49 @@ export interface NativeDecisionQuestion {
   id: string; question: string; options: (string | NativeDecisionOption)[];
   multi?: boolean; recommended?: number; disabledIndices?: number[];
 }
+export interface NativeFormSpan { text: string; style?: "code" | "strong" | "em"; }
+export interface NativeFormChoice {
+  kind: "choice"; name: string; question?: string; multi: boolean; select: boolean; other: boolean;
+  label: NativeFormSpan[]; required: boolean;
+  options: { value: string; label: NativeFormSpan[]; checked: boolean; disabled: boolean }[];
+}
+export interface NativeFormText {
+  kind: "text"; name: string; question?: string; type: string; multiline: boolean; label: NativeFormSpan[];
+  value: string; placeholder: string; required: boolean; rows: number;
+  min?: number; max?: number; pattern?: string; minLength?: number; maxLength?: number;
+}
+export type NativeFormField = NativeFormChoice | NativeFormText;
+export type NativeFormBlock =
+  | { kind: "text"; spans: NativeFormSpan[]; heading: boolean }
+  | { kind: "list"; items: NativeFormSpan[][]; ordered: boolean }
+  | { kind: "pre"; text: string }
+  | { kind: "table"; rows: NativeFormSpan[][][]; headerRows: number }
+  | { kind: "image"; src: string; alt: string; displaySrc?: string; mediaError?: string }
+  | { kind: "svg"; markup: string; alt: string; displaySrc?: string; mediaError?: string }
+  | { kind: "field"; field: NativeFormField; optionsEnd?: number };
+export interface NativeForm {
+  sections: { title: NativeFormSpan[]; blocks: NativeFormBlock[]; fieldset: boolean }[];
+  fields: NativeFormField[]; hidden: [string, string][];
+}
+export type NativeFormValue = string | number | string[];
+export interface NativeFormResponse {
+  data: Record<string, NativeFormValue>;
+  notes?: { name: string; question?: string; option?: string; value: string; text: string }[];
+}
 export interface NativeDecisionPayload {
   method?: string; title?: string; message?: string; prompt?: { full: string; compact: string };
   options?: (string | NativeDecisionOption)[]; disabledIndices?: number[]; initialIndex?: number; helpText?: string;
-  placeholder?: string; prefill?: string; questions?: NativeDecisionQuestion[];
+  placeholder?: string; prefill?: string; secret?: boolean; questions?: NativeDecisionQuestion[];
   acceptImages?: boolean; supportsChat?: boolean; timeout?: number; cwd?: string;
+  form?: NativeForm; defaults?: Record<string, NativeFormValue>;
 }
 export interface NativeDecisionImage { type: "image"; data: string; mimeType: string; }
 export interface NativeDecisionResult {
-  id: string; selectedOptions: string[]; customInput?: string; note?: string;
+  id: string; selectedOptions: string[]; customInput?: string; note?: string; noteOption?: string;
   customInputImages?: NativeDecisionImage[]; noteImages?: NativeDecisionImage[];
 }
 export type HumanDecisionResponse = boolean | string | { cancelled: true } | { kind: "chat" }
-  | { kind: "submit"; results: NativeDecisionResult[] };
+  | { kind: "submit"; results: NativeDecisionResult[] } | NativeFormResponse;
 export interface HumanDecision {
   target: HumanDecisionTarget; createdAt: number; instanceName: string; instanceKind: string;
   agentOrigin: { kind: string; id?: string | null; name?: string | null } | null;

@@ -243,8 +243,11 @@ class HeadlessDisplay:
         self.vnc_port = self._listener.getsockname()[1]
         descriptor = self._listener.fileno()
         environment = {**self._environment(), "WAYLAND_DISPLAY": self.wayland.name}
+        # wayvnc turns the viewer's key symbols into keys of its own layout (US unless told otherwise);
+        # symbols that layout lacks, such as æ ø å, are dropped.
+        layout = [] if self.displays.keyboard == "default" else [f"--keyboard={self.displays.keyboard}"]
         self.wayvnc = self._spawn(wayvnc, ["--config", str(config), "--socket", str(control),
-                                           "--log-level=warning", f"fd:{descriptor}"],
+                                           "--log-level=warning", *layout, f"fd:{descriptor}"],
                                   environment, pass_fds=(descriptor,))
         deadline = time.monotonic() + COMPOSITOR_TIMEOUT
         while True:
@@ -386,9 +389,10 @@ class HeadlessDisplays:
 
     headless = True
 
-    def __init__(self, root, emit):
+    def __init__(self, root, emit, keyboard="default"):
         self.root = Path(root)
         self.emit = emit
+        self.keyboard = keyboard
         self._generation = 0
         self._lock = threading.Lock()
 

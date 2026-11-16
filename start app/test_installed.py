@@ -82,14 +82,20 @@ class InstalledProfileTests(unittest.TestCase):
         (profile / "store/core/bin/agent").write_bytes(b"private-copy")
         self.assertEqual((self.core / "bin/agent").read_bytes(), b"agent-runtime")
 
-    def test_deselection_uses_a_new_generation_and_same_selection_reuses_cache(self):
+    def test_deselection_replaces_the_generation_and_same_selection_reuses_cache(self):
         selected = {"core": self.bundle(self.core), "optional": self.bundle(self.optional)}
         first = self.install(selected)
         self.assertEqual(self.install(selected), first)
         self.assertEqual(self.copies, 1)
+        # Staging left by a killed launch: read-only like a copied store, and never a published generation.
+        abandoned = self.state / "installed/.install-killed/store/core"
+        abandoned.mkdir(parents=True)
+        (abandoned / "agent").write_bytes(b"partial")
+        abandoned.chmod(0o555)
+        abandoned.parent.chmod(0o555)
         second = self.install({"core": self.bundle(self.core)})
         self.assertNotEqual(first, second)
-        self.assertTrue((first / "store/optional/bin/language-server").exists())
+        self.assertEqual(list((self.state / "installed").iterdir()), [second])
         self.assertFalse((second / "store/optional").exists())
         self.assertFalse((second / "programs/language-server").exists())
         self.assertTrue((second / "store/dependency/bin/helper").exists())

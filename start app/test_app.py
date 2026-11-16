@@ -55,6 +55,33 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(self.policy.snapshot()["websites"], ["https://example.com"])
         self.assertTrue(self.policy.snapshot()["internet"])
 
+    def test_copy_again_requires_authentication_explicit_consent_and_idle_runtime(self):
+        path = "/api/omp-copy"
+        body = json.dumps({"replace_previous": True})
+        pending = self.policy.directory / "omp-recopy.json"
+        for headers in ({}, {"Authorization": f"Bearer {self.server.token}", "Origin": "https://evil.example"}):
+            self.assertEqual(self.request("POST", path, body, headers)[0], 403)
+        self.assertFalse(pending.exists())
+        headers = {"Authorization": f"Bearer {self.server.token}"}
+        for value in ({}, {"replace_previous": False}, {"replace_previous": 1}, {"replace_previous": True, "extra": 1}):
+            self.assertEqual(self.request("POST", path, json.dumps(value), headers)[0], 400)
+        self.assertFalse(pending.exists())
+        self.assertEqual(self.request("POST", path, body, headers)[0], 200)
+        first = json.loads(pending.read_text())
+        self.assertEqual(set(first), {"replace_previous", "request_id"})
+        self.assertIs(first["replace_previous"], True)
+        self.assertRegex(first["request_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(self.request("POST", path, body, headers)[0], 200)
+        self.assertEqual(json.loads(pending.read_text()), first)
+        status = json.loads(self.request("GET", "/api/status", headers=headers)[1])
+        self.assertTrue(status["runtime"]["omp_copy_pending"])
+        pending.unlink()
+        with patch.object(self.runtime, "operation", object()):
+            self.assertEqual(self.request("POST", path, body, headers)[0], 400)
+        self.assertFalse(pending.exists())
+        self.assertEqual(self.request("POST", path, body, headers)[0], 200)
+        self.assertNotEqual(json.loads(pending.read_text())["request_id"], first["request_id"])
+
     def test_private_history_requires_authenticated_same_origin_get(self):
         target = "https://private.example.com"
         self.policy.deny("website", target, "not allowed")

@@ -248,20 +248,21 @@ class LifecycleTests(unittest.TestCase):
             self.addCleanup(original.close)
         self.runtime.host, self.runtime.isolated = "darwin", vm
         desired = self.policy.snapshot()
-        desired.update(installed_mode=True, selected_packages=["gh"])
+        desired.update(installed_mode=True, selected_packages=["gh"], keyboard_layout="dk")
         self.policy.replace(desired)
         self.runtime.start(str(self.nix.source), "container", False, "none", "omp")
         self.assertTrue(vm.admitted.wait(5))
         # Saved while the launch prepares: next Start's choice, never this launch's.
         changed = self.policy.snapshot()
-        changed.update(installed_mode=False, selected_packages=["ssh"])
+        changed.update(installed_mode=False, selected_packages=["ssh"], keyboard_layout="default")
         self.policy.replace(changed)
         launch = self.runtime.status()["launch"]
         self.assertEqual((launch["installed_mode"], launch["selected_packages"], launch["executable"]),
                          (True, ["gh"], None))
-        self.assertEqual(vm.received, [{"installed_mode": True, "selected_packages": ["gh"]}])
+        admitted = {"installed_mode": True, "selected_packages": ["gh"], "keyboard_layout": "dk"}
+        self.assertEqual(vm.received, [admitted])
         self.runtime.requirements_status()
-        self.assertEqual(vm.asked, {"installed_mode": True, "selected_packages": ["gh"]})
+        self.assertEqual(vm.asked, admitted)
         self.stop()
         self.runtime.requirements_status()
         self.assertIsNone(vm.asked, "An idle launcher shows the desired policy")

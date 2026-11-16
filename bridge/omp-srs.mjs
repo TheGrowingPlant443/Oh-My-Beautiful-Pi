@@ -67,7 +67,7 @@ const DESCRIPTIONS = {
   srs_read_evidence: 'Read the frozen admitted evidence by evidenceId from inventory; continue with nextOffset (64 KiB text pages). No arbitrary files, execution or network. Unsupported evidence remains a human blocker. Native image content is provided when supported.',
   srs_write_document_chunk: 'Stage exact UTF-8 Markdown for an allocated document/revision, at byte offset with expectedPrefixHash. Chunks at most 64 KiB; arbitrarily many chunks/documents. Replay identical chunks safely. No paths or overwrite authority.',
   srs_commit_document: 'Publish a staged Markdown revision after full hash, ID, link and obligation validation. Metadata cannot set paths or approve human questions. Requirements must be portable; legacy UI and implementation observations are separately labelled. Internal citations stay in private audit, never public notes.',
-  srs_checkpoint: 'Commit one revision-fenced bounded ledger update. Backend allocates work/document/requirement/question IDs; ref associates returned IDs to this batch. Relations append; page additional updates without total job caps. Only humans exclude scope or confirm stakeholder questions. For native Ask, first allocate questions here, then use exactly each returned questionId as Ask question id.',
+  srs_checkpoint: 'Commit one revision-fenced bounded ledger update. Backend allocates work/document/requirement/question IDs; ref associates returned IDs to this batch. Relations append; page additional updates without total job caps. Only humans exclude scope or confirm stakeholder questions. For native Ask, first allocate questions here. In Ask HTML use each exact returned questionId as the control name, the exact ledger prompt as its label/legend, and exactly the ledger option labels; radio/select for one choice, checkboxes/multiple select for multi. Do not use hidden fields or duplicate control names. For question-array Ask use the returned questionId as question id.',
   srs_finish_stage: 'Commit a phase review against expectedRevision. Backend checks read receipts, ledger, current document hashes/links, template coverage, traceability and unresolved material questions. Gaps queue more work indefinitely. Prose, empty batch or a fixed number of passes cannot complete SRS.',
   srs_delegate: 'Run a real native SRS worker for preallocated work/documents and explicit evidence IDs in this stage. It can persist assigned findings and document revisions during inspection, but cannot allocate entities, use native Ask, answer humans, finish a stage, delegate, or use arbitrary tools. Calls may run in parallel for independent scopes. Inspect durable delegations and work after interruption; reassignment never grants an old worker renewed authority.',
 };
@@ -85,6 +85,7 @@ export function installSrsBridge(pi, { request, workspace, currentContext }) {
   const children = new Map();
   const recording = new Map();
   const hasRecorded = state => !state?.pending || (state.checkpoint && state.document);
+  const askForms = new Map();
   async function recordedTool(name, params, delegation) {
     const key = delegation?.assignmentId ?? params.stageId;
     let state = recording.get(key);
@@ -344,11 +345,11 @@ export function installSrsBridge(pi, { request, workspace, currentContext }) {
     },
     ask: {
       active: () => guard.activeSrs(currentContext()),
-      async map(invocationId, questions) {
+      async map(invocationId, questions, format) {
         const active = guard.activeSrs(currentContext());
         if (!active) throw new Error('srs_stage_not_active');
-        const result = await request('srs_ask_map', bounded({ invocationId, questions: questions.map(question => ({ id: question.id, question: question.question, options: question.options.map(option => typeof option === 'string' ? option : option.label), multi: question.multi ?? false })) }));
-        if (result?.mapped !== true || !sameStage(result, active) || result.unmappedIds?.length || result.mappedIds?.length !== questions.length) {
+        const result = await request('srs_ask_map', bounded({ invocationId, ...(format ? { format } : {}), questions: questions.map(question => ({ id: question.id, question: question.question, options: question.options.map(option => typeof option === 'string' ? option : option.label), multi: question.multi ?? false })) }));
+        if (result?.mapped !== true || !sameStage(result, active) || result.unmappedIds?.length || result.mappedIds?.length !== questions.length || (format === 'html' && !srsFormBindingsMatch(result.questionBindings, questions))) {
           // The backend may have persisted a valid subset even though no native dialog can be opened.
           // Retire that exact invocation before rejecting so those ledger questions can be asked again.
           try {
@@ -362,13 +363,107 @@ export function installSrsBridge(pi, { request, workspace, currentContext }) {
         }
         return result;
       },
-      receipt: (invocationId, provenance, results) => request('srs_ask_receipt', bounded({ invocationId, provenance, results: results.map(({ id, selectedOptions, customInput, note }) => ({ id, selectedOptions, ...(customInput === undefined ? {} : { customInput }), ...(note === undefined ? {} : { note }) })) })),
-      retired: (invocationId, reason) => request('srs_ask_retired', { invocationId, reason }),
+      async mapForm(invocationId, form) {
+        const fields = srsFormFields(form);
+        const result = await this.map(invocationId, fields.map(field => ({ id: field.name, question: field.question, options: field.options.map(option => option.label), multi: field.multi })), 'html');
+        for (const [index, field] of fields.entries()) for (const [optionIndex, option] of field.options.entries()) {
+          option.displayLabel = option.label;
+          option.label = result.questionBindings[index].options[optionIndex];
+        }
+        askForms.set(invocationId, fields);
+        return result;
+      },
+      formResponse(invocationId, answer) {
+        const fields = askForms.get(invocationId);
+        if (!fields) throw new Error('srs_question_not_mapped');
+        return srsFormResponse(fields, answer);
+      },
+      async receiptForm(invocationId, provenance, answer) {
+        const fields = askForms.get(invocationId);
+        if (!fields) throw new Error('srs_question_not_mapped');
+        const result = await this.receipt(invocationId, provenance, srsFormResults(fields, answer));
+        askForms.delete(invocationId);
+        return result;
+      },
+      receipt: (invocationId, provenance, results) => request('srs_ask_receipt', bounded({ invocationId, provenance, results: results.map(({ id, selectedOptions, customInput, note, noteOption }) => ({ id, selectedOptions, ...(customInput === undefined ? {} : { customInput }), ...(note === undefined ? {} : { note: noteOption === undefined ? note : `${noteOption}: ${note}` }) })) })),
+      retired: (invocationId, reason) => { askForms.delete(invocationId); return request('srs_ask_retired', { invocationId, reason }); },
     },
     disconnected() { disconnected = true; revokeChildren(); monitor.disconnected(); yielded(guard.srs(currentContext()), 'disconnected'); },
     reconnect() { disconnected = false; monitor.reconnect(); },
-    dispose() { disposed = true; revokeChildren(); recording.clear(); monitor.dispose(); detach(); guard.setNativeHost(null); },
+    dispose() { disposed = true; revokeChildren(); recording.clear(); askForms.clear(); monitor.dispose(); detach(); guard.setNativeHost(null); },
   };
+}
+
+// HTML collapses whitespace; the backend returns the exact ledger labels so receipts never rewrite saved choices.
+function srsFormBindingsMatch(bindings, questions) {
+  const visible = text => text.replace(/\s+/g, ' ').trim();
+  return Array.isArray(bindings) && bindings.length === questions.length && bindings.every((binding, index) =>
+    binding.id === questions[index].id && Array.isArray(binding.options) && binding.options.length === questions[index].options.length &&
+    binding.options.every((label, option) => typeof label === 'string' && visible(label) === visible(questions[index].options[option])));
+}
+
+function srsFormFields(form) {
+  if (form.hidden?.length || !form.fields?.length) throw new Error('srs_question_not_mapped: Ask must contain only named ledger questions, without hidden fields.');
+  const names = new Set();
+  return form.fields.map(field => {
+    if (!field.name || names.has(field.name) || !['choice', 'text'].includes(field.kind) || typeof field.question !== 'string') throw new Error('srs_question_not_mapped: Each Ask field must have a unique ledger questionId and its exact question.');
+    names.add(field.name);
+    const options = field.kind === 'choice' ? field.options.map(option => ({ value: option.value, label: option.label.map(span => span.text).join(''), disabled: option.disabled })) : [];
+    if (new Set(options.map(option => option.value)).size !== options.length) throw new Error('srs_question_not_mapped: Ask option values must be unambiguous.');
+    return { name: field.name, question: field.question, kind: field.kind, type: field.type, multi: field.kind === 'choice' && field.multi, other: field.kind === 'choice' && field.other, options };
+  });
+}
+
+function srsFormResults(fields, { data, notes = [] }) {
+  if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).some(name => !fields.some(field => field.name === name))) throw new Error('invalid_srs_answer: Unexpected form field.');
+  return fields.map(field => {
+    const value = Object.hasOwn(data, field.name) ? data[field.name] : undefined;
+    const values = value === undefined ? [] : Array.isArray(value) ? value : [value];
+    const selectedOptions = [], custom = [];
+    for (const item of values) {
+      if (typeof item !== 'string' && !(field.kind === 'text' && typeof item === 'number' && Number.isFinite(item))) throw new Error('invalid_srs_answer: Invalid field value.');
+      const option = field.options.find(option => option.value === item);
+      if (option) selectedOptions.push(option.label);
+      else if (field.kind === 'text' || field.other) custom.push(String(item));
+      else throw new Error('invalid_srs_answer: Unknown choice value.');
+    }
+    if (custom.length > 1 || (!field.multi && values.length > 1)) throw new Error('invalid_srs_answer: Ambiguous field values.');
+    const note = notes.filter(note => note.name === field.name).map(note => `${note.option}: ${note.text}`).join('\n');
+    return { id: field.name, selectedOptions, ...(custom.length ? { customInput: custom[0] } : {}), ...(note ? { note } : {}) };
+  });
+}
+
+// The SRS question panel answers one mapped question; the Decisions surface owns whole multi-field forms.
+function srsFormResponse(fields, answer) {
+  if (fields.length !== 1 || fields[0].name !== answer?.id) throw new Error('invalid_srs_answer: Answer this form in Decisions.');
+  const field = fields[0], selected = answer.selectedOptions;
+  if (!Array.isArray(selected) || new Set(selected).size !== selected.length) throw new Error('invalid_srs_answer: Invalid selected options.');
+  const options = selected.map(label => {
+    const matches = field.options.filter(option => option.label === label && !option.disabled);
+    if (matches.length !== 1) throw new Error('invalid_srs_answer: Choice label is unavailable or ambiguous.');
+    return matches[0];
+  });
+  const values = options.map(option => option.value);
+  const custom = answer.customInput;
+  if (custom !== undefined && typeof custom !== 'string') throw new Error('invalid_srs_answer: Invalid custom input.');
+  if (custom) {
+    if (field.kind === 'choice' && (!field.other || field.options.some(option => option.value === custom))) throw new Error('invalid_srs_answer: Custom input cannot be represented by this form.');
+    values.push(custom);
+  }
+  const array = field.multi && field.options.length > 1;
+  if (!array && values.length > 1) throw new Error('invalid_srs_answer: This form cannot represent a choice and custom input together.');
+  const data = {};
+  if (field.kind === 'text') {
+    const text = custom ?? '';
+    const value = ['number', 'range'].includes(field.type) && text.trim() !== '' ? Number(text) : text;
+    if (typeof value === 'number' && !Number.isFinite(value)) throw new Error('invalid_srs_answer: Invalid numeric input.');
+    data[field.name] = value;
+  } else if (array) data[field.name] = values;
+  else if (values.length) data[field.name] = values[0];
+  if (answer.note !== undefined && typeof answer.note !== 'string') throw new Error('invalid_srs_answer: Invalid note.');
+  if (!answer.note) return { data };
+  if (options.length !== 1) throw new Error('invalid_srs_answer: Attach this note to an option in Decisions.');
+  return { data, notes: [{ name: field.name, question: field.question, option: options[0].displayLabel, value: options[0].value, text: answer.note }] };
 }
 function attachImage(name, result, content) {
   if (name !== 'srs_read_evidence' || result.kind !== 'image' || !result.image) return;

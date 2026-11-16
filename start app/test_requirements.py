@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from requirements import host_workspace, prepare_workspace
+from requirements import FOLDERS, host_workspace, prepare_workspace, requirement_enabled
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -54,6 +54,14 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(path.is_symlink())
         with self.assertRaises(OSError):
             prepare_workspace(path)
+
+    def test_private_omp_copy_is_not_a_revocable_host_mount(self):
+        folders = {key: {"id": key, "label": label, "path": path, "kind": "folder"}
+                   for key, label, path in FOLDERS}
+        self.assertNotIn("host-omp", folders)
+        self.assertEqual(folders["omp-copy"]["path"], "/home/sandbox/.omp")
+        for installed in (False, True):
+            self.assertTrue(requirement_enabled(folders["omp-copy"], installed, ["omp-copy", "host-omp"]))
 
 
 if __name__ == '__main__':

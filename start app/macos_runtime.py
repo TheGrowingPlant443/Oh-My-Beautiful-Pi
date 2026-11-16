@@ -30,6 +30,7 @@ import time
 from catalog import user_folders
 from file_broker import FileBrokerServer, ProtocolError, encode_frame, read_frame
 from host_files import HostFiles
+from omp_copy import read_copy_request, write_snapshot
 from packages import LANGUAGE_SERVER_COMMANDS, PACKAGE_CHOICES
 from policy import read_private_json
 from requirements import CONTAINER_WORKSPACE, FOLDERS, HOST_WORKSPACE, prepare_workspace, requirement_enabled
@@ -54,8 +55,9 @@ ACK_DEADLINE = 5
 RETIRE_DEADLINE = 10
 GIB = 1 << 30
 DISCLOSURE = ("Isolated mode on macOS runs OMBP in this launcher's own Linux VM: Linux Nix programs only, software "
-              "rendering, and its own persistent OMP/OMSP configuration, logins and sessions inside the VM (your "
-              "Mac ~/.omp is not shared and nothing is copied).")
+              "rendering, and a private persistent copy of your Mac ~/.omp, including logins and sessions. "
+              "The initial copy happens once; Copy again replaces it only on the next isolated Start. "
+              "Your Mac ~/.omp is never mounted or changed.")
 _RECEIPT_FIELDS = {"generation", "instance", "arch", "image", "state", "created"}
 
 
@@ -531,11 +533,22 @@ class VmBackend:
         """`installation` is the admitted launch's captured choice; otherwise the desired policy applies."""
         snapshot = self.policy.snapshot()
         installed = (installation or snapshot)["installed_mode"]
-        return [{**item, "enabled": requirement_enabled(item, installed, snapshot["disabled_requirements"]),
-                 "label": ("Private persistent Linux VM home (separate OMP/OMSP state)"
+        rows = [self._copy_requirement(item) for item in self.requirements]
+        if not any(item["id"] == "omp-copy" for item in rows):
+            rows.append(self._copy_requirement({"id": "omp-copy", "kind": "folder"}))
+        return [{**item, "enabled": item["id"] == "omp-copy" or
+                 requirement_enabled(item, installed, snapshot["disabled_requirements"]),
+                 "label": ("Private persistent Linux VM home (independent copy, including credentials)"
                            if item["id"] == "sandbox-home" else "SonarQube engine (filtered VM Podman)"
                            if item["id"] == "sonar-engine" else item["label"])}
-                for item in self.requirements if item["id"] != "host-omp"]
+                for item in rows]
+
+    @staticmethod
+    def _copy_requirement(item):
+        if item["id"] in ("host-omp", "omp-copy"):
+            return {**item, "id": "omp-copy", "label": "Private ~/.omp copy in the Linux VM (not a host mount)",
+                    "path": "/home/sandbox/.omp", "enabled": True}
+        return item
 
     def _save_requirements(self, items):
         rows = []
@@ -548,13 +561,14 @@ class VmBackend:
             if isinstance(programs, list) and all(isinstance(name, str) and 0 < len(name) <= 255
                                                   and "/" not in name and "\x00" not in name for name in programs):
                 row["programs"] = sorted(set(programs))
-            if row["id"] == "host-omp":
-                continue  # The VM never binds the Mac's ~/.omp; there is no shared-state toggle to offer.
+            row = self._copy_requirement(row)
             if row["id"] == "sandbox-home":
-                row["label"] = "Private OMBP home in the Linux VM (its own OMP/OMSP logins and sessions)"
+                row["label"] = "Private Linux VM home (independent ~/.omp copy, including credentials)"
             elif row["id"] == "sonar-engine":
                 row["label"] = "SonarQube engine (filtered VM Podman)"
             rows.append(row)
+        if not any(row["id"] == "omp-copy" for row in rows):
+            rows.append(self._copy_requirement({"id": "omp-copy", "kind": "folder"}))
         self.policy.save("requirements.json", rows)
         with self.lock:
             self.requirements = rows
@@ -913,6 +927,7 @@ class VmBackend:
             children.check()
         snapshot_id = secrets.token_hex(16)
         self._send_snapshot(settings["source"], snapshot_id, children, log)
+        self._copy_omp(session, children, log)
         run = VmRun()
         with self.lock:
             self.run = run
@@ -926,6 +941,7 @@ class VmBackend:
                 from mac_network import HostNetwork, keyring_unlock
                 run.network = HostNetwork(self.policy)
                 run.network.start()
+                step(log, "Connecting website and file gateways to the VM")
                 status = session.request("status", timeout=10)
                 run.forward = self._forwards(status["forwards"], run, children, transient)
                 snapshot = self.policy.snapshot()
@@ -942,8 +958,8 @@ class VmBackend:
                         proxy_ca=run.network.public_ca().decode("ascii"),
                         workspace={"host_workspace": HOST_WORKSPACE, "container_workspace": CONTAINER_WORKSPACE},
                         installation={"installed_mode": installation["installed_mode"],
-                                      "selected_packages": list(installation["selected_packages"])},
-                        # The Mac home as the guest sees it under /host, never the guest account's own home.
+                                      "selected_packages": list(installation["selected_packages"]),
+                                      "keyboard_layout": installation["keyboard_layout"]},
                         git_discovery_home="/host" + str(Path.home().resolve()))
                     if not isinstance(receipt, dict) or type(receipt.get("run")) is not int:
                         raise RuntimeError("The guest returned an invalid launch receipt")
@@ -974,6 +990,89 @@ class VmBackend:
             if isinstance(children, OwnedChildren) and children.cancelled:
                 raise Cancelled("Launch cancelled") from None
             raise
+
+    def _copy_omp(self, session, children, log):
+        """Copy only on first Start or explicit recopy; the control session alone can publish the received tar."""
+        children.check()
+        status = session.request("omp_copy_status")
+        pending = self.policy.directory / "omp-recopy.json"
+        request_id = read_copy_request(self.policy.directory)
+        replace = request_id is not None
+        if replace and status.get("request_id") == request_id:
+            pending.unlink()
+            return
+        if status["copied"] and not replace:
+            return
+        source = Path.home() / ".omp"
+        resolved = source.resolve()
+        for root in (self.policy.directory, self.home):
+            private = root.resolve()
+            if private == resolved or private.is_relative_to(resolved) or resolved.is_relative_to(private):
+                raise ValueError("Launcher/VM state and the host ~/.omp copy source must not overlap")
+        from mac_network import keyring_unlock
+        token = None
+        children.adopt(session.process, group=True)
+        process = None
+        try:
+            children.check()
+            receipt = session.request("omp_copy_begin", replace=replace, request_id=request_id,
+                                      keyring_unlock=keyring_unlock(self.policy))
+            token = receipt["token"]
+            step(log, "Copying full ~/.omp into the private Linux VM home")
+            process = children.popen(
+                [*self._ssh(), f"{shlex.quote(self.wrapper)} receive-omp-copy {shlex.quote(token)}"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, start_new_session=True)
+            digest = hashlib.sha256()
+
+            class Sink:
+                def write(self, data):
+                    children.check()
+                    process.stdin.write(data)
+                    digest.update(data)
+                    return len(data)
+
+                def flush(self):
+                    process.stdin.flush()
+
+            report = write_snapshot(Sink(), source, check=children.check,
+                                    progress=lambda message: step(log, message))
+            process.stdin.close()
+            output = process.stdout.read()
+            process.wait()
+            children.check()
+            if process.returncode or output.strip() != b"ok":
+                raise RuntimeError("The Linux runtime refused the private ~/.omp copy")
+            session.request("omp_copy_commit", timeout=3600, token=token, digest=digest.hexdigest())
+            if replace:
+                pending.unlink()
+            step(log, "Private ~/.omp copy complete: "
+                 f"{report.get('files', 0)} files; "
+                 f"{report.get('special_files', 0)} special files skipped; "
+                 f"{report.get('external_links', 0)} external symlinks preserved; "
+                 f"{report.get('sqlite_databases', 0)} SQLite databases backed up; "
+                 f"source missing: {bool(report.get('source_missing'))}")
+        except BaseException:
+            if process is not None:
+                terminate(process, 5)
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                if token is not None:
+                    session.request("omp_copy_cancel", token=token)
+            except (OSError, RuntimeError, ValueError):
+                pass
+            children.check()
+            raise
+        finally:
+            try:
+                children.release(session.process)
+            finally:
+                if process is not None:
+                    process.stdout.close()
+                    if not process.stdin.closed:
+                        process.stdin.close()
 
     def _send_snapshot(self, source, snapshot_id, children, log):
         step(log, "Sending source snapshot")

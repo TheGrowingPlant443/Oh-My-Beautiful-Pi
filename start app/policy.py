@@ -26,8 +26,10 @@ AUTO_APPROVE = {"enabled": True, "sites": ["anthropic.com", "chatgpt.com", "goog
 SITE_OPTIONS = {"dependencies": {}, "all_dependencies": [], "header_dependencies": [], "exact_hosts": []}
 # Next-launch installation choices; older saved settings get these too, keeping every existing grant.
 # They are launch inputs, not live permissions, and are never part of saved launch settings.
+# "default" leaves the isolated display's keyboard as it is; other values name an XKB layout for the VM viewer.
+KEYBOARD_LAYOUTS = ("default", "dk")
 INSTALLATION_DEFAULTS = {"installed_mode": True, "selected_packages": DEFAULT_PACKAGES,
-                         "hide_language_server_denials": True}
+                         "keyboard_layout": "default", "hide_language_server_denials": True}
 # Random per-state key unlocking the sandbox's private Secret Service keyring; host state only, never mounted.
 KEYRING_UNLOCK = "keyring-unlock.json"
 _KEYRING_UNLOCK_VALUE = re.compile(r"[A-Za-z0-9_-]{64}")
@@ -164,7 +166,8 @@ class Policy:
         """A fresh copy of the next isolated launch's installation choice; an admitted launch keeps its own."""
         with self.lock:
             return {"installed_mode": self.data["installed_mode"],
-                    "selected_packages": list(self.data["selected_packages"])}
+                    "selected_packages": list(self.data["selected_packages"]),
+                    "keyboard_layout": self.data["keyboard_layout"]}
 
     def save(self, name, value):
         temporary = self.directory / f".{name}.tmp"
@@ -258,6 +261,8 @@ class Policy:
                 "internet", "allow_all_network", "folder_write_default", "installed_mode",
                 "hide_language_server_denials")):
             raise ValueError("Switches must be booleans")
+        if value["keyboard_layout"] not in KEYBOARD_LAYOUTS:
+            raise ValueError("Unknown keyboard layout")
         if any(not isinstance(value[key], list) for key in ("folders", "programs", "websites", "credential_origins")):
             raise ValueError("Permission lists are required")
         folders = [self._folder(item) for item in value["folders"]]
@@ -280,6 +285,7 @@ class Policy:
                 "auto_start": self._auto_start(value["auto_start"]),
                 "installed_mode": value["installed_mode"],
                 "selected_packages": validate_packages(value["selected_packages"]),
+                "keyboard_layout": value["keyboard_layout"],
                 "hide_language_server_denials": value["hide_language_server_denials"],
                 "disabled_requirements": sorted(set(disabled)), **self._site_options(value, websites),
                 "auto_approve": self._auto_approve(value["auto_approve"])}

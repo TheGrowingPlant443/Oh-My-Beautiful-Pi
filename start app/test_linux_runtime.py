@@ -1,6 +1,7 @@
 import contextlib
 import errno
 import json
+import io
 import os
 from pathlib import Path
 import secrets
@@ -49,8 +50,7 @@ class ContainerBackendTests(unittest.TestCase):
         profile = self.root / "private-install"
         self.backend.installed_profile = profile
         args = []
-        with patch.object(self.backend, "_host_omp", return_value=None):
-            self.backend._mount_resources(args, self.root / "home", ["nix-store"])
+        self.backend._mount_resources(args, self.root / "home", ["nix-store"])
         mounts = [args[i + 1] for i, value in enumerate(args) if value == "--volume"]
         self.assertIn(f"{profile}/store:/nix/store:ro", mounts)
         self.assertIn(f"{profile}/programs:/installed-programs:ro", mounts)
@@ -60,8 +60,7 @@ class ContainerBackendTests(unittest.TestCase):
         self.assertFalse(any(":/allowed-programs:" in value for value in mounts))
         self.backend.installed_profile = None
         args = []
-        with patch.object(self.backend, "_host_omp", return_value=None):
-            self.backend._mount_resources(args, self.root / "home", [])
+        self.backend._mount_resources(args, self.root / "home", [])
         mounts = [args[i + 1] for i, value in enumerate(args) if value == "--volume"]
         self.assertIn(f"{self.backend.mount}/store:/nix/store:ro", mounts)
         self.assertIn(f"{self.backend.mount}/programs:/allowed-programs:ro", mounts)
@@ -95,19 +94,103 @@ class ContainerBackendTests(unittest.TestCase):
                 self.assertIsNone(self.backend.process)
                 self.assertIsNone(self.backend.desktop_process)
 
-    def test_host_omp_bind_never_exposes_launcher_state(self):
-        home = self.root / "home"
-        (home / ".omp").mkdir(parents=True)
+    def test_private_copy_never_mounts_host_and_preserves_edits_until_recopy(self):
+        host = self.root / "user"
+        source = host / ".omp"
+        source.mkdir(parents=True)
+        (source / ".env").write_text("SYNTHETIC_TOKEN=fixture")
+        self.backend.log = io.BytesIO()
+        self.backend.proxy = ProxyEndpoint(self.root / "network/proxy.sock", self.root / "network/ca.pem")
+        with patch.object(Path, "home", return_value=host):
+            self.backend._copy_omp()
+            private = self.backend.policy.directory / "home/.omp"
+            self.assertEqual((private / ".env").read_text(), "SYNTHETIC_TOKEN=fixture")
+            (private / ".env").write_text("private change")
+            with patch.object(Path, "home", side_effect=AssertionError("Restart inspected host OMP")):
+                self.backend._copy_omp()
+            self.assertEqual((private / ".env").read_text(), "private change")
+            self.backend.policy.save("omp-recopy.json", {"replace_previous": True, "request_id": "a" * 32})
+            self.backend._copy_omp()
+            self.assertEqual((private / ".env").read_text(), "SYNTHETIC_TOKEN=fixture")
+            self.assertEqual((private.parent / ".omp.previous/.env").read_text(), "private change")
+            self.assertFalse((self.backend.policy.directory / "omp-recopy.json").exists())
+            args = []
+            self.backend._mount_resources(args, private.parent, [])
+        self.assertFalse(any(":/home/sandbox/.omp:" in value for value in args))
+        self.assertNotIn(str(source), " ".join(args))
+        self.assertEqual((source / ".env").read_text(), "SYNTHETIC_TOKEN=fixture")
+
+    def test_private_copy_rejects_launcher_state_overlap(self):
+        host = self.root / "user"
+        source = host / ".omp"
+        source.mkdir(parents=True)
         alias = self.root / "alias"
-        alias.symlink_to(home / ".omp", target_is_directory=True)
-        with patch.dict(os.environ, {"HOME": str(home)}):
-            self.assertEqual(self.backend._host_omp([]), (home / ".omp").resolve())
-            self.assertIsNone(self.backend._host_omp(["host-omp"]))
-            for state in (home / ".omp" / "ombp-start", alias / "state"):
+        alias.symlink_to(source, target_is_directory=True)
+        with patch.object(Path, "home", return_value=host):
+            for state in (source / "ombp-start", alias / "state"):
                 with self.subTest(state=state):
                     backend = ContainerBackend(Policy(state))
-                    with self.assertRaisesRegex(ValueError, "overlaps protected launcher path"):
-                        backend._host_omp([])
+                    self.addCleanup(backend.stop)
+                    with self.assertRaisesRegex(ValueError, "overlaps launcher state"):
+                        backend._copy_omp()
+
+    def test_cancelled_copy_keeps_recopy_request_for_next_start(self):
+        self.backend.policy.save("omp-recopy.json", {"replace_previous": True, "request_id": "a" * 32})
+        self.backend.children.cancel()
+        with patch.object(Path, "home", return_value=self.root / "user"):
+            with self.assertRaisesRegex(RuntimeError, "Launch cancelled"):
+                self.backend._copy_omp()
+        self.assertTrue((self.backend.policy.directory / "omp-recopy.json").exists())
+
+    def test_recopy_retry_preserves_backup_after_publication_or_recovery(self):
+        import omp_copy
+        host = self.root / "host-fixture"
+        source = host / ".omp"
+        source.mkdir(parents=True)
+        (source / ".env").write_text("synthetic host")
+        for failure in ("published", "intent"):
+            with self.subTest(failure=failure), patch.object(Path, "home", return_value=host):
+                backend = ContainerBackend(Policy(self.root / failure))
+                self.addCleanup(backend.stop)
+                backend.log = io.BytesIO()
+                backend._copy_omp()
+                private = backend.policy.directory / "home/.omp"
+                (private / ".env").write_text("original private edits")
+                pending = backend.policy.directory / "omp-recopy.json"
+                backend.policy.save(pending.name, {"replace_previous": True, "request_id": "b" * 32})
+                unlink, recover = Path.unlink, omp_copy._recover
+
+                def interrupt_unlink(path, *args, **kwargs):
+                    if path == pending:
+                        raise OSError("synthetic lost acknowledgement")
+                    return unlink(path, *args, **kwargs)
+
+                def interrupt_recovery(root):
+                    if omp_copy._json_read(root, omp_copy._INTENT) is not None:
+                        raise OSError("synthetic interruption after durable intent")
+                    return recover(root)
+
+                interrupted = (patch.object(Path, "unlink", interrupt_unlink) if failure == "published"
+                               else patch.object(omp_copy, "_recover", interrupt_recovery))
+                with interrupted, self.assertRaises(OSError):
+                    backend._copy_omp()
+                self.assertTrue(pending.exists())
+                expected = "synthetic host"
+                if failure == "published":
+                    expected = "edits after successful publication"
+                    (private / ".env").write_text(expected)
+                with patch.object(Path, "home", side_effect=AssertionError("Recopy retry inspected source")):
+                    backend._copy_omp()
+                self.assertFalse(pending.exists())
+                self.assertEqual((private / ".env").read_text(), expected)
+                self.assertEqual((private.parent / ".omp.previous/.env").read_text(), "original private edits")
+
+    def test_stale_requirement_becomes_private_copy(self):
+        self.backend.requirements = [{"id": "host-omp", "label": "shared", "kind": "folder", "path": "old"}]
+        row, = self.backend.requirements_status()
+        self.assertEqual(row["id"], "omp-copy")
+        self.assertNotIn("shared", row["label"])
+        self.assertEqual(row["path"], "/home/sandbox/.omp")
 
     def test_workspace_grant_uses_canonical_host_path_and_fixed_container_path(self):
         system_alias = self.root / "tmp-alias"
@@ -286,7 +369,7 @@ class PrivateBrowserTrustTests(unittest.TestCase):
         self.assertEqual(outside.read_text(), "sandbox-authored module configuration")
         self.assertTrue(all((stored / name).is_symlink() for name in ("cert9.db", "key4.db", "pkcs11.txt")))
         args = []
-        self.backend._mount_resources(args, self.home, ["host-omp", "tool-chrome"])
+        self.backend._mount_resources(args, self.home, ["tool-chrome"])
         self.assertIn(f"{private}:/home/sandbox/.pki:rw", args)
         self.assertIn(f"{self.root}:/network:ro", args)
         self.assertIn(f"{self.ca}:/trust/ca.pem:ro", args)

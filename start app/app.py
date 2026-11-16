@@ -177,6 +177,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Prepare takes an empty JSON object")
                 self.respond(202, {"operation_id": self.server.runtime.prepare()})
                 return
+            elif self.path == "/api/omp-copy":
+                if not isinstance(value, dict) or set(value) != {"replace_previous"}:
+                    raise ValueError("Copy again requires explicit backup replacement confirmation")
+                self.server.runtime.copy_omp_again(value["replace_previous"])
             elif self.path == "/api/stop":
                 self.server.runtime.stop()
             elif self.path == "/api/history/clear":

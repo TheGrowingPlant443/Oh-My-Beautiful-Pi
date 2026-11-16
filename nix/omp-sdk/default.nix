@@ -5,7 +5,7 @@ pkgs.importNpmLock.buildNodeModules {
   nodejs = pkgs.nodejs_24;
   derivationArgs = {
     pname = "omp-manager-sdk";
-    version = "18.12.6";
+    version = "18.20.3";
     # The bridge consumes SDK source. Do not run optional ONNX/native download hooks.
     npm_config_ignore_scripts = "true";
     npmRebuildFlags = [ "--ignore-scripts" ];

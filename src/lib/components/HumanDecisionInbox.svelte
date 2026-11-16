@@ -2,6 +2,8 @@
   import type { HumanDecision, HumanDecisionResponse, HumanDecisionTarget, NativeDecisionQuestion } from "../api";
   import { askResponse, canAnswer, decisionKey, humanDecisions, nativeOption, readDecisionImage, toggleQuestionOption, type QuestionDraft } from "../human-decisions";
   import { allInstances } from "../stores";
+  import NativeDecisionForm from "./NativeDecisionForm.svelte";
+  import { formResponse } from "../native-form";
 
   let { onOpenSession }: { onOpenSession?: (id: string) => void } = $props();
   const unavailable = $derived($allInstances.filter(instance => instance.status === "running" && instance.capabilities?.nativeDecisions !== true));
@@ -22,7 +24,10 @@
     try {
       const draft = $humanDecisions.drafts.get(decisionKey(item.target));
       if (!draft || draft.loadingImages) return;
-      void humanDecisions.submit(item.target, response ?? (item.method === "askDialog" ? askResponse(item, draft) : draft.text));
+      const answer = response ?? (item.method === "formDialog"
+        ? formResponse(item.payload.form!, draft.form)
+        : item.method === "askDialog" ? askResponse(item, draft) : draft.text);
+      void humanDecisions.submit(item.target, answer);
     } catch (error) {
       humanDecisions.updateDraft(item.target, draft => ({ ...draft, error: String(error) }));
     }
@@ -79,8 +84,18 @@
               <div class="option"><button type="button" disabled={item.payload.disabledIndices?.includes(index)} onclick={() => submit(item, option.label)}>{option.label}</button>{#if option.description}<p>{option.description}</p>{/if}{#if option.preview}<pre>{option.preview}</pre>{/if}</div>
             {/each}</div>
           {:else if item.method === "input" || item.method === "editor"}
-            <label>Answer<textarea rows={item.method === "editor" ? 8 : 3} placeholder={item.payload.placeholder ?? ""} value={draft.text} oninput={event => setText(item.target, event.currentTarget.value)}></textarea></label>
+            <label>Answer
+              {#if item.method === "input" && item.payload.secret}
+                <input type="password" autocomplete="off" placeholder={item.payload.placeholder ?? ""} value={draft.text} oninput={event => setText(item.target, event.currentTarget.value)} />
+              {:else}
+                <textarea rows={item.method === "editor" ? 8 : 3} placeholder={item.payload.placeholder ?? ""} value={draft.text} oninput={event => setText(item.target, event.currentTarget.value)}></textarea>
+              {/if}
+            </label>
             <button type="button" class="primary" onclick={() => submit(item)}>Submit answer</button>
+          {:else if item.method === "formDialog" && item.payload.form}
+            <NativeDecisionForm form={item.payload.form} drafts={draft.form} id={key} showErrors={!!draft.error}
+              onChange={(index, update) => humanDecisions.updateDraft(item.target, draft => ({ ...draft, form: draft.form.map((field, at) => at === index ? update(field) : field) }))}
+              onSubmit={() => submit(item)} />
           {:else if item.method === "askDialog"}
             {#each item.payload.questions ?? [] as question (question.id)}
               {@const answer = draft.questions[question.id]}

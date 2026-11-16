@@ -579,6 +579,76 @@ test('installed SDK validator accepts the strict SRS schemas and rejects model-s
   assert.equal(schemas.srs_write_document_chunk.safeParse({ ...ids, documentId: 'd', revisionId: 'r', offset: 0, text: '# x', expectedPrefixHash: HASH }).success, true);
 });
 
+test('native HTML Ask fields bind exact SRS ledger questions and preserve values, Other text and option notes', {
+  skip: sdk && process.env.OMBP_AGENT !== 'omsp' ? false : 'Set OMP_SDK_DIR to exercise OMP HTML forms',
+}, async () => {
+  const html = '<form><fieldset><legend>Who\n  approves refunds?</legend><label><input type="radio" name="q-1" value="manager">Manager</label><label><input type="radio" name="q-1" value="clerk">Clerk</label></fieldset><fieldset><legend>Channels?</legend><label><input type="checkbox" name="q-2" value="web">Web</label><label><input type="checkbox" name="q-2" value="desk">Desk</label></fieldset><label>Why?<textarea name="q-3"></textarea></label></form>';
+  const script = `const {parseHtmlForm}=await import(${JSON.stringify(pathToFileURL(path.join(sdk, '..', 'pi-tui', 'src', 'html-form', 'parse.ts')).href)}); const {fieldQuestions}=await import(${JSON.stringify(pathToFileURL(path.join(sdk, '..', 'pi-tui', 'src', 'html-form', 'data.ts')).href)}); const form=parseHtmlForm(${JSON.stringify(html)}); const questions=fieldQuestions(form); console.log(JSON.stringify({...form,fields:form.fields.map(field=>({...field,question:questions.get(field)}))}));`;
+  const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', ['--eval', script], { timeout: 30000 });
+  const form = JSON.parse(stdout);
+  const h = harness({ handlers: {
+    srs_ask_map: payload => {
+      assert.equal(payload.format, 'html');
+      return { ...ids, mapped: true, mappedIds: payload.questions.map(question => question.id), unmappedIds: [],
+        questionBindings: payload.questions.map(question => ({ id: question.id, options: question.options.map(label => payload.invocationId === 'whitespace' && label === 'Manager' ? '\nManager\t' : label) })) };
+    },
+    srs_ask_receipt: () => ({ receiptId: 'receipt' }),
+    srs_ask_retired: () => ({ ok: true }),
+  } });
+  await h.admitActive();
+  await h.srs.ask.mapForm('form-1', form);
+  assert.deepEqual(h.state.requests.find(item => item.action === 'srs_ask_map').payload.questions, [
+    { id: 'q-1', question: 'Who approves refunds?', options: ['Manager', 'Clerk'], multi: false },
+    { id: 'q-2', question: 'Channels?', options: ['Web', 'Desk'], multi: true },
+    { id: 'q-3', question: 'Why?', options: [], multi: false },
+  ]);
+  await h.srs.ask.receiptForm('form-1', 'human', { data: { 'q-1': 'manager', 'q-2': ['desk', 'Phone'], 'q-3': 'Stakeholder context' },
+    notes: [{ name: 'q-1', question: 'Who approves refunds?', option: 'Manager', value: 'manager', text: 'Confirmed by owner' }] });
+  assert.deepEqual(h.state.requests.find(item => item.action === 'srs_ask_receipt').payload.results, [
+    { id: 'q-1', selectedOptions: ['Manager'], note: 'Manager: Confirmed by owner' },
+    { id: 'q-2', selectedOptions: ['Desk'], customInput: 'Phone' },
+    { id: 'q-3', selectedOptions: [], customInput: 'Stakeholder context' },
+  ]);
+  await assert.rejects(h.srs.ask.receiptForm('form-1', 'human', { data: {} }), /not_mapped/);
+  await assert.rejects(h.srs.ask.mapForm('hidden', { ...form, hidden: [['q-1', 'manager']] }), /not_mapped/);
+  await assert.rejects(h.srs.ask.mapForm('duplicate', { ...form, fields: [...form.fields, form.fields[0]] }), /not_mapped/);
+  await assert.rejects(h.srs.ask.mapForm('ambiguous', { ...form, fields: [{ ...form.fields[0], options: [form.fields[0].options[0], form.fields[0].options[0]] }] }), /not_mapped/);
+  await h.srs.ask.mapForm('retired', form);
+  await h.srs.ask.retired('retired', 'cancelled');
+  await assert.rejects(h.srs.ask.receiptForm('retired', 'human', { data: {} }), /not_mapped/);
+  await h.srs.ask.mapForm('invalid', form);
+  await assert.rejects(h.srs.ask.receiptForm('invalid', 'human', { data: { extra: 'forged' } }), /Unexpected form field/);
+  await assert.rejects(h.srs.ask.receiptForm('invalid', 'human', { data: { 'q-1': ['manager', 'clerk'] } }), /Ambiguous field values/);
+  await h.srs.ask.mapForm('single', { ...form, fields: [form.fields[0]] });
+  const response = h.srs.ask.formResponse('single', { id: 'q-1', selectedOptions: ['Manager'], note: 'Confirmed' });
+  assert.deepEqual(response, { data: { 'q-1': 'manager' }, notes: [{ name: 'q-1', question: 'Who approves refunds?', option: 'Manager', value: 'manager', text: 'Confirmed' }] });
+  assert.throws(() => h.srs.ask.formResponse('single', { id: 'q-1', selectedOptions: ['Manager'], customInput: 'Clerk too' }), /cannot represent/);
+  assert.throws(() => h.srs.ask.formResponse('single', { id: 'q-1', selectedOptions: [], customInput: 'Someone else', note: 'Unattached' }), /Attach this note/);
+  assert.throws(() => h.srs.ask.formResponse('single', { id: 'q-1', selectedOptions: [], customInput: 'manager' }), /cannot be represented/);
+  assert.throws(() => h.srs.ask.formResponse('single', { id: 'q-1', selectedOptions: ['Forged'] }), /unavailable/);
+  assert.throws(() => h.srs.ask.formResponse('invalid', { id: 'q-1', selectedOptions: ['Manager'] }), /Decisions/);
+  await h.srs.ask.receiptForm('single', 'human', response);
+  assert.deepEqual(h.state.requests.filter(item => item.action === 'srs_ask_receipt').at(-1).payload.results, [{ id: 'q-1', selectedOptions: ['Manager'], note: 'Manager: Confirmed' }]);
+  await h.srs.ask.mapForm('whitespace', { ...form, fields: [form.fields[0]] });
+  const exact = h.srs.ask.formResponse('whitespace', { id: 'q-1', selectedOptions: ['\nManager\t'], note: 'Keep exact ledger labels' });
+  assert.equal(exact.data['q-1'], 'manager');
+  assert.equal(exact.notes[0].option, 'Manager', 'native notes retain the actual displayed label');
+  await h.srs.ask.receiptForm('whitespace', 'human', exact);
+  assert.deepEqual(h.state.requests.filter(item => item.action === 'srs_ask_receipt').at(-1).payload.results[0].selectedOptions, ['\nManager\t']);
+  h.srs.dispose();
+});
+
+test('extension Ask receipts preserve option-attached notes and fork question notes', async () => {
+  const h = harness({ handlers: { srs_ask_receipt: () => ({ receiptId: 'receipt' }) } });
+  await h.srs.ask.receipt('extension', 'nativeHuman', [{ id: 'q-1', selectedOptions: ['Manager'], note: 'Confirmed', noteOption: 'Manager' }]);
+  await h.srs.ask.receipt('fork', 'human', [{ id: 'q-1', selectedOptions: ['Manager'], note: 'Confirmed' }]);
+  const receipts = h.state.requests.filter(item => item.action === 'srs_ask_receipt');
+  assert.equal(receipts[0].payload.results[0].note, 'Manager: Confirmed');
+  assert.equal(receipts[1].payload.results[0].note, 'Confirmed');
+  h.srs.dispose();
+});
+
+
 test('installed SDK compaction, willContinue and automatic continuation keep SRS authorization (real AgentSession, offline mock provider)', {
   skip: sdk ? false : 'Set OMP_SDK_DIR for the isolated installed-SDK compaction proof', timeout: 120000,
 }, async () => {

@@ -26,6 +26,7 @@ from host_files import HostFiles
 from network import NetworkGateway, read_public_ca
 from policy import KEYRING_UNLOCK, new_keyring_unlock, read_keyring_unlock, read_private_json, valid_keyring_unlock
 from installed import build_packages, install_profile
+from omp_copy import copy_once, copy_status, read_copy_request
 from requirements import (CONTAINER_WORKSPACE, DISPLAY_SOCKET, FOLDERS, HOST_WORKSPACE, bundles, prepare_workspace,
                           requirement_enabled)
 from runtime import OwnedChildren, step, terminate
@@ -200,8 +201,15 @@ class ContainerBackend:
         """Requirement rows; `installation` is the admitted launch's captured choice, else desired policy applies."""
         snapshot = self.policy.snapshot()
         installed = (installation or snapshot)["installed_mode"]
-        return [{**item, "enabled": requirement_enabled(item, installed, snapshot["disabled_requirements"])}
-                for item in self.requirements]
+        labels = {key: (label, path) for key, label, path in FOLDERS}
+        rows = []
+        for item in self.requirements:
+            key = "omp-copy" if item["id"] == "host-omp" else item["id"]
+            row = {**item, "id": key}
+            if key in labels:
+                row.update(label=labels[key][0], path=labels[key][1])
+            rows.append({**row, "enabled": requirement_enabled(row, installed, snapshot["disabled_requirements"])})
+        return rows
 
     def start(self, executable, desktop, gpu, source, agent, log, children, *, installation, git_discovery_home,
               proxy=None, workspace=None, keyring_password=None):
@@ -305,6 +313,8 @@ class ContainerBackend:
         mesa = os.environ.get("START_APP_MESA")
         snapshot = self.policy.snapshot()
         disabled = snapshot["disabled_requirements"]
+        if "sandbox-home" in disabled:
+            raise ValueError("Restore 'Private OMBP home' to use the private OMP copy")
         if self.displays is not None and "desktop-socket" in disabled:
             raise ValueError("OMBP needs its isolated desktop socket in the macOS Linux VM; restore "
                              "'Isolated desktop socket' under Required private folders")
@@ -324,6 +334,8 @@ class ContainerBackend:
             proxy = ProxyEndpoint(Path(self.gateway.socket_path), Path(self.gateway.ca_path))
         self.proxy = proxy
         root = self._rootfs(shell, coreutils)
+        if not self.external_network:
+            self._copy_omp()
         home = self.policy.directory / "home"
         home.mkdir(exist_ok=True, mode=0o700)
         browser = base.get("package-chromium" if installed else "tool-chrome")
@@ -432,28 +444,28 @@ class ContainerBackend:
         if self.browser_trust:
             # Chrome uses NSS_InitReadWrite and silently drops local trust on a read-only database.
             self._mount(args, Path(self.browser_trust.name) / ".pki", "/home/sandbox/.pki", True)
-        host_omp = self._host_omp(disabled)
-        if host_omp:
-            # User-approved direct bind: SQLite locks, mmap and hardlinks behave exactly as for host OMP.
-            self._mount(args, host_omp, "/home/sandbox/.omp", True)
         self._mount(args, self.mount / "host", "/host", True)
         if not self.installed_profile:
             self._mount(args, self.mount / "programs", "/allowed-programs")
 
-    def _host_omp(self, disabled):
-        if self.external_network:
-            # This machine's ~/.omp is not the user's; the VM keeps OMP state in the private sandbox home.
-            return None
-        path = Path.home() / ".omp"
-        if "host-omp" in disabled or path.is_symlink() or not path.is_dir():
-            return None
-        path = path.resolve()
-        for private in map(Path, self.policy.private_paths):
-            if path.is_relative_to(private) or private.is_relative_to(path):
-                # The direct bind bypasses the gateway, so it must never expose keys, policy or runtime sockets.
-                raise ValueError(f"~/.omp overlaps protected launcher path {private}; move it outside ~/.omp "
-                                 "or revoke 'Your OMP folder' under Folder access")
-        return path
+    def _copy_omp(self):
+        self.children.check()
+        state = self.policy.directory
+        pending = state / "omp-recopy.json"
+        report = copy_status(state)
+        request_id = read_copy_request(state)
+        if report["copied"] and (request_id is None or report.get("request_id") == request_id):
+            if request_id is not None:
+                pending.unlink()
+            return
+        source = Path.home() / ".omp"
+        resolved = source.resolve()
+        if resolved.is_relative_to(state) or state.is_relative_to(resolved):
+            raise ValueError("~/.omp overlaps launcher state; move launcher state outside ~/.omp")
+        report = copy_once(source, state, replace=request_id is not None, request_id=request_id,
+                           check=self.children.check, progress=lambda message: step(self.log, message))
+        pending.unlink(missing_ok=True)
+        step(self.log, f"Private OMP copy: {json.dumps(report, sort_keys=True)}")
 
     def _browser_trust_start(self, home):
         certutil = os.environ.get("START_APP_CERTUTIL")

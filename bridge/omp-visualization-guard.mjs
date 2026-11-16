@@ -233,6 +233,22 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       if (open.some(guard => guard.mode === 'monitor')) return { block: true, reason: MONITOR_BLOCK };
       return { block: true, reason: 'This turn is a read-only visualization analysis or a bound SRS stage. Only its exact request/stage allowlist and native ask are available; commands, arbitrary reads, file changes, other generation and delegation are refused.' };
     },
+    // UI calls can bypass tool_call. The form adapter supplies every resource source before loading or opening native UI.
+    authorizeFormMedia(ctx, actor, sources) {
+      if (!main(ctx)) {
+        if (guards.size) throw new Error('analysis_authorization_missing: The main session context is required for a guarded form.');
+        return;
+      }
+      const ask = api.toolCall({ toolName: TOOLS.ask, input: {} }, ctx);
+      if (ask?.block) throw new Error(ask.reason);
+      if (!live(ctx).length) return;
+      // Built-in Ask calls the captured root UI directly; it has no extension actor attribution.
+      if (!['main', 'unattributed'].includes(actor?.kind) || (actor.kind === 'main' && ctx.agent.id && actor.id !== ctx.agent.id)) throw new Error('analysis_authorization_missing: Only the main Architect can ask during this analysis.');
+      for (const source of sources) {
+        const read = api.toolCall({ toolName: 'read', input: { path: source } }, ctx);
+        if (read?.block) throw new Error(`Analysis form media refused: ${read.reason}`);
+      }
+    },
     toolResult(event, ctx) {
       if (!main(ctx) || event?.isError) return;
       for (const guard of live(ctx)) {

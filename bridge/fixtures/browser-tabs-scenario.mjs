@@ -77,10 +77,10 @@ export default async function tabsScenario(pi) {
       const driven=await cell('var mine=browser.tab("tab-1");await mine.evaluate(()=>{document.body.innerHTML="<input id=x>";});await mine.fill("#x","controlled");print("FLOW:"+JSON.stringify({value:await mine.value("#x"),own:await tab.url()}));');
       assert.equal(driven.value,'controlled','The AI must be able to control the hand-opened tab');
       assert.match(driven.own,/AI(%20| )tab/,'The AI tab must be untouched');
-      const renamed=await cell('var other=await browser.open({name:"user",app:{target:"User tab"}});print("FLOW:"+JSON.stringify({title:await other.evaluate(()=>document.title),rows:(await browser.tabs()).map(t=>t.name)}));');
+      const renamed=await cell('var other=await browser.open({name:"user",target:"User tab"});print("FLOW:"+JSON.stringify({title:await other.evaluate(()=>document.title),rows:(await browser.tabs()).map(t=>t.name)}));');
       assert.equal(renamed.title,'User tab');
       assert.deepEqual(renamed.rows,['browser','user'],'Re-attaching under a name must replace the automatic tab');
-      const missing=await cell('var message=null;try{await browser.open({name:"nope",app:{target:"no such page"}});}catch(error){message=error.message;}print("FLOW:"+JSON.stringify({message}));');
+      const missing=await cell('var message=null;try{await browser.open({name:"nope",target:"no such page"});}catch(error){message=error.message;}print("FLOW:"+JSON.stringify({message}));');
       assert.match(missing.message,/No browser page matched "no such page"\. Available pages:/);
       await cell('await other.close();print("FLOW:"+JSON.stringify({done:true}));');
       assert.equal((await chromePages()).list.length,1,'Closing an attached tab closes its page');

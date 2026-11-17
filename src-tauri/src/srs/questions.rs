@@ -140,12 +140,19 @@ struct NativeQuestion {
     #[serde(default)]
     multi: bool,
 }
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AskFormat {
+    Html,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MapRequest {
     invocation_id: String,
     #[serde(default)]
     tool_call_id: Option<String>,
+    #[serde(default)]
+    format: Option<AskFormat>,
     questions: Vec<NativeQuestion>,
 }
 #[derive(Deserialize, Clone, Copy)]
@@ -273,6 +280,13 @@ fn answer_value(answer: &NormalizedAnswer) -> Value {
     json!({"questionId":answer.id,"selectedOptions":answer.selected_options,"customInput":answer.custom_input,"note":answer.note})
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionBinding {
+    id: String,
+    options: Vec<String>,
+}
+
 /// Immutable mapping of one native Ask invocation to ledger questions, bound to the exact producer/attempt/stage.
 /// Only `state`, receipt and retirement fields ever change, and only once.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -287,6 +301,8 @@ struct Invocation {
     fingerprint: String,
     mapped_ids: Vec<String>,
     unmapped_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    question_bindings: Vec<QuestionBinding>,
     native_count: usize,
     /// live | answered | retired
     state: String,
@@ -298,17 +314,41 @@ struct Invocation {
     resolved_at: Option<u64>,
 }
 fn mapping_value(inv: &Invocation) -> Value {
-    json!({"mapped":true,"jobId":inv.job_id,"attemptId":inv.attempt_id,"stageId":inv.stage_id,"mappedIds":inv.mapped_ids,"unmappedIds":inv.unmapped_ids})
+    let mut value = json!({"mapped":true,"jobId":inv.job_id,"attemptId":inv.attempt_id,"stageId":inv.stage_id,"mappedIds":inv.mapped_ids,"unmappedIds":inv.unmapped_ids});
+    if !inv.question_bindings.is_empty() {
+        value["questionBindings"] = json!(inv.question_bindings);
+    }
+    value
 }
-fn bound(question: &Question, native: &NativeQuestion) -> bool {
+fn html_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c| matches!(c, '\u{0009}'..='\u{000d}' | ' ' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'))
+        .filter(|part| !part.is_empty())
+}
+fn html_text(text: &str) -> String {
+    html_words(text).fold(String::with_capacity(text.len()), |mut out, part| {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(part);
+        out
+    })
+}
+fn bound(question: &Question, native: &NativeQuestion, format: Option<AskFormat>) -> bool {
+    if question.multi != native.multi || question.options.len() != native.options.len() {
+        return false;
+    }
+    if format == Some(AskFormat::Html) {
+        if !html_words(&question.prompt).eq(html_words(&native.question)) {
+            return false;
+        }
+        let mut labels = HashSet::new();
+        return question.options.iter().zip(&native.options).all(|(l, n)| {
+            let label = html_text(&l.label);
+            !label.is_empty() && html_words(&label).eq(html_words(n.label())) && labels.insert(label)
+        });
+    }
     question.prompt == native.question
-        && question.multi == native.multi
-        && question.options.len() == native.options.len()
-        && question
-            .options
-            .iter()
-            .zip(&native.options)
-            .all(|(l, n)| l.label == n.label())
+        && question.options.iter().zip(&native.options).all(|(l, n)| l.label == n.label())
 }
 
 /// Projects a durable authenticated human answer for allowed model inspection, including after a conversation
@@ -689,10 +729,14 @@ impl SrsService {
         Ok(())
     }
     fn map_fingerprint(req: &MapRequest) -> Result<String> {
-        Ok(store::hash(&serde_json::to_vec(&json!({
+        let mut value = json!({
             "toolCallId":req.tool_call_id,
             "questions":req.questions.iter().map(|q| json!({"id":q.id,"question":q.question,"options":q.options.iter().map(|o| o.label()).collect::<Vec<_>>(),"multi":q.multi})).collect::<Vec<_>>(),
-        })).map_err(storage)?))
+        });
+        if let Some(format) = req.format {
+            value["format"] = json!(format);
+        }
+        Ok(store::hash(&serde_json::to_vec(&value).map_err(storage)?))
     }
     /// An invocation ID maps once: an identical replay returns the stored mapping, anything else is rejected.
     fn replay_mapping(
@@ -733,6 +777,7 @@ impl SrsService {
         &self,
         job: &Job,
         native: &NativeQuestion,
+        format: Option<AskFormat>,
         retired: &mut Vec<Invocation>,
     ) -> Result<Option<Question>> {
         if store::safe_id(&native.id).is_err()
@@ -745,7 +790,7 @@ impl SrsService {
         }
         let q: Question = self.store.get(&job.job_id, "questions", &native.id)?;
         Ok(
-            if bound(&q, native) && self.ask_eligible(job, &q, retired)? {
+            if bound(&q, native, format) && self.ask_eligible(job, &q, retired)? {
                 Some(q)
             } else {
                 None
@@ -757,20 +802,27 @@ impl SrsService {
         job: &Job,
         req: &MapRequest,
         retired: &mut Vec<Invocation>,
-    ) -> Result<(Vec<String>, Vec<String>, Vec<Mutation>)> {
-        let (mut mapped, mut unmapped, mut writes) = (Vec::new(), Vec::new(), Vec::new());
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Mutation>, Vec<QuestionBinding>)> {
+        let (mut mapped, mut unmapped, mut writes, mut bindings) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for native in &req.questions {
-            let Some(mut q) = self.map_candidate(job, native, retired)? else {
+            let Some(mut q) = self.map_candidate(job, native, req.format, retired)? else {
                 unmapped.push(native.id.clone());
                 continue;
             };
+            if req.format == Some(AskFormat::Html) {
+                bindings.push(QuestionBinding {
+                    id: q.question_id.clone(),
+                    options: q.options.iter().map(|option| option.label.clone()).collect(),
+                });
+            }
             q.state = "asked".into();
             q.live = true;
             q.invocation_id = Some(req.invocation_id.clone());
             writes.push(store::mutation("questions", &q.question_id, &q)?);
             mapped.push(native.id.clone());
         }
-        Ok((mapped, unmapped, writes))
+        Ok((mapped, unmapped, writes, bindings))
     }
     fn ask_map(
         &self,
@@ -798,7 +850,8 @@ impl SrsService {
             .clone()
             .ok_or_else(|| "stale_attempt: No bound attempt".to_string())?;
         let mut retired: Vec<Invocation> = Vec::new();
-        let (mapped, unmapped, question_writes) = self.map_questions(&job, &req, &mut retired)?;
+        let (mapped, unmapped, question_writes, question_bindings) =
+            self.map_questions(&job, &req, &mut retired)?;
         if mapped.is_empty() {
             return Ok(json!({"mapped":false,"mappedIds":[],"unmappedIds":unmapped}));
         }
@@ -812,6 +865,7 @@ impl SrsService {
             fingerprint,
             mapped_ids: mapped,
             unmapped_ids: unmapped,
+            question_bindings,
             native_count: req.questions.len(),
             state: "live".into(),
             receipt_id: None,
@@ -1123,8 +1177,7 @@ impl SrsService {
                     "This native Ask carries several questions; answer it from the Decisions card",
                 ));
             }
-            let response =
-                json!({"kind":"submit","results":[serde_json::to_value(&norm).map_err(storage)?]});
+            let response = serde_json::to_value(&norm).map_err(storage)?;
             return Ok(Outcome::Live {
                 producer: inv.producer,
                 invocation: inv.invocation_id,
@@ -1452,6 +1505,37 @@ mod tests {
     }
     const YN: &[&str] = &["Yes", "No"];
     const AB: &[&str] = &["A", "B"];
+
+    #[test]
+    fn html_mapping_preserves_ledger_text_and_rejects_ambiguous_labels() {
+        let fx = Fx::new("running", &[("q1", true, false, &["  Pretty\n JSON  ", "Plain text"])], 0);
+        let mut question = fx.question("q1");
+        question.prompt = "  Confirm\n the\tcustomer\u{a0}format  ".into();
+        fx.add(vec![store::mutation("questions", "q1", &question).unwrap()]);
+        let request = json!({"invocationId":"html","format":"html","toolCallId":"call-1","questions":[{"id":"q1","question":"Confirm the customer format","options":["Pretty JSON","Plain text"],"multi":false}]});
+        let mut legacy = request.clone();
+        legacy.as_object_mut().unwrap().remove("format");
+        assert_eq!(
+            fx.svc.ask_bridge(&fx.producer, "srs_ask_map", legacy.clone()).unwrap()["mapped"],
+            false
+        );
+        let mapped = fx.svc.ask_bridge(&fx.producer, "srs_ask_map", request.clone()).unwrap();
+        assert_eq!(mapped["questionBindings"], json!([{"id":"q1","options":["  Pretty\n JSON  ","Plain text"]}]));
+        assert_eq!(fx.svc.ask_bridge(&fx.producer, "srs_ask_map", request).unwrap(), mapped);
+        assert!(fx.svc.ask_bridge(&fx.producer, "srs_ask_map", legacy).unwrap_err().contains("immutable"));
+        assert!(fx.receipt("html", json!([{"id":"q1","selectedOptions":["Pretty JSON"]}])).is_err());
+        fx.receipt("html", json!([{"id":"q1","selectedOptions":["  Pretty\n JSON  "]}])).unwrap();
+        assert_eq!(fx.question("q1").state, "answered");
+        assert_eq!(fx.question("q1").prompt, question.prompt);
+
+        let ambiguous = Fx::new("running", &[("q1", true, false, &["A B", "A\nB"])], 0);
+        let result = ambiguous.svc.ask_bridge(&ambiguous.producer, "srs_ask_map",
+            json!({"invocationId":"collision","format":"html","questions":[{"id":"q1","question":"Prompt q1","options":["A B","A B"],"multi":false}]})).unwrap();
+        assert_eq!(result["mapped"], false);
+        assert_eq!(ambiguous.question("q1").state, "open");
+        assert_eq!(html_text("\u{feff}a\t b\r\nc\u{2028}d\u{a0}"), "a b c d");
+        assert_eq!(html_text("a\u{85}b"), "a\u{85}b");
+    }
 
     #[test]
     fn receipt_is_atomic_idempotent_and_counts_once() {
@@ -1828,6 +1912,15 @@ mod tests {
         // Live single-question Ask with the Manager absent: error, nothing changes.
         fx.map("single", &["q1"]).unwrap();
         let revision = fx.job().revision;
+        let mut job = fx.job();
+        let outcome = fx
+            .svc
+            .answer_locked(&mut job, "q1", "r", answer().unwrap(), &mut Vec::new())
+            .unwrap();
+        let Outcome::Live { response, .. } = outcome else {
+            panic!("A live question must be settled by its native dialog");
+        };
+        assert_eq!(response, json!({"id":"q1","selectedOptions":["Yes"]}));
         let err = fx
             .svc
             .dispose_srs_item(

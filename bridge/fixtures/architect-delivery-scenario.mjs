@@ -54,7 +54,7 @@ export default async function architectDelivery(pi) {
     for (const forbidden of ['ask', 'task', 'eval', 'bash', 'read', 'write', 'edit', 'srs_delegate', 'srs_finish_stage', 'fixture_escape']) assert.equal(names.includes(forbidden), false, forbidden);
     const steps = [
       tool('fixture_escape', {}),
-      tool('ask', { questions: [{ id: 'forged', question: 'Approve?', options: [{ label: 'Yes' }] }] }),
+      tool('ask', process.env.OMBP_AGENT === 'omsp' ? { questions: [{ id: 'forged', question: 'Approve?', options: [{ label: 'Yes' }] }] } : { html: '<form><fieldset><legend>Approve?</legend><label><input type="radio" name="forged" value="yes">Yes</label></fieldset></form>' }),
       tool('srs_read_evidence', { ...ids, evidenceId: 'evidence-1' }),
       tool('srs_checkpoint', { ...ids, expectedRevision: 0, updates: { updateWork: [{ id: 'work-1', status: 'reviewed', rationale: 'Expired authorization is refused without changing prior state.', evidenceIds: ['evidence-1'] }], summary: 'Finding committed during inspection.' } }),
       tool('srs_write_document_chunk', { ...ids, documentId: 'document-1', revisionId: 'revision-1', offset: 0, expectedPrefixHash: hash(''), text: content }),

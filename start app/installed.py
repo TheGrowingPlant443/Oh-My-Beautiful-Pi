@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import tempfile
 
@@ -72,8 +73,22 @@ def _profile_manifest(bundles, run):
     return {"version": 1, "roots": all_roots, "programs": programs}
 
 
+def _discard(path):
+    """Remove one cached copy; copied store directories are read-only, so make them removable first."""
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+        return
+    for directory, _, _ in os.walk(path):
+        os.chmod(directory, 0o700)
+    shutil.rmtree(path)
+
+
 def install_profile(directory, bundles, run, check_cancelled):
-    """Atomically cache complete package closures and executable links, without host credentials."""
+    """Atomically cache complete package closures and executable links, without host credentials.
+
+    Exactly one generation is kept: each is several GiB, so superseded generations (once the new one is
+    published) and staging abandoned by a killed launch are removed instead of filling the disk.
+    """
     manifest = _profile_manifest(bundles, run)
     check_cancelled()
     encoded = json.dumps(manifest, sort_keys=True).encode()
@@ -81,6 +96,13 @@ def install_profile(directory, bundles, run, check_cancelled):
     cache = Path(directory) / "installed"
     _private_directory(cache)
     target = cache / key
+
+    def prune(keep):
+        for entry in cache.iterdir():
+            if not keep(entry.name):
+                _discard(entry)
+
+    prune(lambda name: not name.startswith(".install-"))
     if target.exists() or target.is_symlink():
         _private_directory(target)
         record = target / "manifest.json"
@@ -89,6 +111,7 @@ def install_profile(directory, bundles, run, check_cancelled):
                        for name in ("store", "programs"))):
             raise ValueError("Cached container installation is incomplete or changed")
         check_cancelled()
+        prune(lambda name: name == key)
         return target
     with tempfile.TemporaryDirectory(prefix=".install-", dir=cache) as staging:
         stage = Path(staging)
@@ -106,4 +129,5 @@ def install_profile(directory, bundles, run, check_cancelled):
         (stage / "manifest.json").write_bytes(encoded)
         check_cancelled()
         os.replace(stage, target)
+    prune(lambda name: name == key)
     return target

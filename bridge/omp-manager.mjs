@@ -9,6 +9,7 @@ import { registerCodeQualityTool } from './omp-code-quality.mjs';
 import { installNativeDecisions } from './omp-native-ui.mjs';
 import { installSrsBridge } from './omp-srs.mjs';
 import { installConfigPolicy } from './omp-config-policy.mjs';
+import { registerVisualizationGuard } from './omp-visualization-guard.mjs';
 
 const MAX_FRAME = 64 * 1024 * 1024;
 const ACTIONS = ['list','create','start','stop','restart','remove','send','interrupt','screen','transcript','plan','subagents','respond','keys','subscribe','request_human'];
@@ -33,7 +34,11 @@ export function managerParameters(z) {
   const image = z.object({ type: z.literal('image'), data: z.string(), mimeType: z.string() }).strict();
   const result = z.object({
     id: z.string(), selectedOptions: z.array(z.string()), customInput: z.string().optional(),
-    note: z.string().optional(), customInputImages: z.array(image).optional(), noteImages: z.array(image).optional(),
+    note: z.string().optional(), noteOption: z.string().optional(), customInputImages: z.array(image).optional(), noteImages: z.array(image).optional(),
+  }).strict();
+  const form = z.object({
+    data: z.record(z.string(), z.union([z.string(), z.number(), z.array(z.string())])),
+    notes: z.array(z.object({ name: z.string(), question: z.string().optional(), option: z.string().optional(), value: z.string(), text: z.string() }).strict()).optional(),
   }).strict();
   return z.object({
     action: z.enum(ACTIONS), instanceId: z.string().optional(), name: z.string().optional(),
@@ -46,7 +51,7 @@ export function managerParameters(z) {
     enabled: z.boolean().optional(), reason: z.string().optional(),
     response: z.union([z.string(), z.boolean(), z.object({ cancelled: z.literal(true) }).strict(),
       z.object({ kind: z.literal('chat') }).strict(),
-      z.object({ kind: z.literal('submit'), results: z.array(result) }).strict()]).optional(),
+      z.object({ kind: z.literal('submit'), results: z.array(result) }).strict(), form]).optional(),
   }).strict();
 }
 
@@ -182,6 +187,10 @@ function nativeQuestionResult(request, question, answer) {
     if (typeof answer[key] !== 'string') throw new Error('custom answer and note must be text');
     result[key] = answer[key];
   }
+  if (answer.noteOption !== undefined) {
+    if (typeof answer.noteOption !== 'string' || !answer.selectedOptions.includes(answer.noteOption)) throw new Error('invalid native note option');
+    result.noteOption = answer.noteOption;
+  }
   for (const key of ['customInputImages','noteImages']) {
     if (answer[key] === undefined) continue;
     if (!request.acceptImages || !validNativeImages(answer[key])) throw new Error('invalid native answer image');
@@ -300,6 +309,7 @@ export default function managerBridge(pi) {
     identity: () => ({ instanceId, generation, ...workspace.identity() }),
     opportunity: () => workspace.opportunity(),
     srs: () => srs?.ask,
+    authorizeMedia: (sources, captured) => formGuard?.authorizeFormMedia(context, captured.agentOrigin, sources),
   });
   const configPolicy = installConfigPolicy(pi, {
     emit,
@@ -326,6 +336,7 @@ export default function managerBridge(pi) {
   if (process.env.OMP_MANAGER_HELPER_REPO) registerRepoInspectTool(pi, process.env.OMP_MANAGER_HELPER_REPO);
   // Set only for The Architect: the one tool that saves its basic/chosen dependency judgements.
   const architectTools = process.env.OMP_MANAGER_ARCHITECT_DIR ? registerClassifyTool(pi, process.env.OMP_MANAGER_ARCHITECT_DIR, { submitPrompt: (message, callbacks) => workspace.submitPrompt(message, callbacks), currentContext: () => context }) : null;
+  const formGuard = architectTools ? registerVisualizationGuard(pi) : null;
   if (architectTools) srs = installSrsBridge(pi, { request, workspace, currentContext: () => context });
   function resolveTerminalRequests() {
     for (const item of pending.values()) if (['terminal','custom'].includes(item.request.method) && item.advisory) item.finish('native', undefined);

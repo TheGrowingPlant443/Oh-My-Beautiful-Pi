@@ -206,7 +206,7 @@ export function installWorkspaceChanges(pi, options) {
       try { aligned = await mode.applyCwdChange(mode.sessionManager.getCwd()); } catch (error) { problem ??= error; }
       problem ??= new Error('Source workspace could not be restored');
     }
-    if (!aligned) await mode.shutdown();
+    if (!aligned) await mode.shutdown({ cancellable: false });
     if (problem) throw new Error(`Workspace rollback failed: ${problem.message ?? problem}; actual cwd: ${mode.sessionManager.getCwd()}`);
     await refresh();
   }

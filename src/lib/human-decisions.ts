@@ -1,12 +1,13 @@
 import { writable } from "svelte/store";
 import type { HumanDecision, HumanDecisionResponse, HumanDecisionSnapshot, HumanDecisionTarget, NativeDecisionImage, NativeDecisionOption, NativeDecisionQuestion, NativeDecisionResult } from "./api";
+import { initialFormDraft, type NativeFormFieldDraft } from "./native-form";
 
 // No live IDs or answer drafts are persisted. App owns the connection, not a keyed terminal body.
 export const decisionKey = (target: HumanDecisionTarget): string => JSON.stringify([
   target.instanceId, target.requestId, target.generation, target.sessionId, target.ownershipEpoch, target.workspaceEpoch,
 ]);
 export const nativeOption = (option: string | NativeDecisionOption): NativeDecisionOption => typeof option === "string" ? { label: option } : option;
-export const canAnswer = (item: HumanDecision): boolean => item.answerable && ["approve", "confirm", "select", "input", "editor", "askDialog"].includes(item.method);
+export const canAnswer = (item: HumanDecision): boolean => item.answerable && ["approve", "confirm", "select", "input", "editor", "askDialog", "formDialog"].includes(item.method);
 /**
  * True iff an authoritative pending native decision belongs to an agent other than the conversation actually on screen,
  * or no conversation is on screen. The total count badge is separate; this never fabricates decisions.
@@ -21,13 +22,13 @@ export interface QuestionDraft {
   customInputImages: NativeDecisionImage[]; noteImages: NativeDecisionImage[];
 }
 export interface DecisionDraft {
-  text: string; questions: Record<string, QuestionDraft>; submitting: boolean;
+  text: string; questions: Record<string, QuestionDraft>; form: NativeFormFieldDraft[]; submitting: boolean;
   awaitingResolution: boolean; loadingImages: number; error: string | null;
 }
 export function initialDecisionDraft(item: HumanDecision): DecisionDraft {
   return { text: item.method === "editor" ? item.payload.prefill ?? "" : "", questions: Object.fromEntries(
     (item.payload.questions ?? []).map(question => [question.id, { selectedOptions: [], customInput: "", note: "", customInputImages: [], noteImages: [] }]),
-  ), submitting: false, awaitingResolution: false, loadingImages: 0, error: null };
+  ), form: initialFormDraft(item.payload.form), submitting: false, awaitingResolution: false, loadingImages: 0, error: null };
 }
 export function toggleQuestionOption(question: NativeDecisionQuestion, draft: QuestionDraft, index: number): QuestionDraft {
   const option = question.options[index];

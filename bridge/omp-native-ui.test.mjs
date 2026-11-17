@@ -48,7 +48,7 @@ test('all raw dialog methods preserve exact prompt data and native-only executab
       ['askDialog', [[{ id: 'q', header: 'Header', question: 'Question?', multi: true, recommended: 1, options: [{ label: 'A', description: 'description', preview: 'preview' }, { label: 'B' }] }]], { kind: 'submit', results: [{ id: 'q', selectedOptions: [], customInput: 'custom', note: 'human note' }] }],
     ];
     for (const [method, args, answer, expected = answer] of prompts) {
-      const options = { signal: signal.signal, timeout: 17, onTimeout, disabledIndices: [1], initialIndex: 0, acceptImages: false };
+      const options = { signal: signal.signal, timeout: 17, onTimeout, disabledIndices: [1], initialIndex: 0, acceptImages: false, secret: method === 'input' };
       const value = f.ui[method](...args, options);
       const request = f.target();
       assert.equal(request.method, method);
@@ -64,6 +64,7 @@ test('all raw dialog methods preserve exact prompt data and native-only executab
       const invocation = f.invocations.at(-1);
       assert.equal(invocation.options.onTimeout, onTimeout);
       assert.equal(invocation.options.timeout, 17);
+      if (method === 'input') { assert.equal(request.secret, true); assert.equal(invocation.options.secret, true); }
       assert.notEqual(invocation.options.signal, signal.signal);
       assert.equal(JSON.stringify(request).includes('onTimeout'), false);
       f.respond(answer);

@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { get } from 'svelte/store';
-import { askResponse, canAnswer, createHumanDecisionStore, decisionKey, hasDecisionAttention, initialDecisionDraft, nativeOption, readDecisionImage, renderedHelperAgentId, toggleQuestionOption } from './human-decisions.ts';
+import { importTs } from './test-loader.mjs';
+const { askResponse, canAnswer, createHumanDecisionStore, decisionKey, hasDecisionAttention, initialDecisionDraft, nativeOption, readDecisionImage, renderedHelperAgentId, toggleQuestionOption } = await importTs('human-decisions');
 
 function decision(overrides = {}) {
   return { target: { instanceId: 'agent', requestId: 'public-id', generation: 3, sessionId: 'session', ownershipEpoch: 4, workspaceEpoch: 5 }, createdAt: 100, instanceName: 'Worker', instanceKind: 'instance', agentOrigin: { kind: 'unattributed' }, repository: { folder: 'C:/repo', label: 'repo', scope: 'repository' }, method: 'input', payload: { title: 'Exact question', placeholder: 'Answer' }, answerable: true, humanOnly: false, ...overrides };
@@ -176,7 +177,7 @@ test('images are read from explicitly selected files and included only when nati
 });
 
 test('human answer union is sent unchanged with the exact fenced target', async () => {
-  for (const [method, response] of [['approve', true], ['approve', false], ['confirm', false], ['select', 'Exact label'], ['input', ''], ['editor', 'full\ntext'], ['askDialog', { kind: 'chat' }], ['askDialog', { cancelled: true }]]) {
+  for (const [method, response] of [['approve', true], ['approve', false], ['confirm', false], ['select', 'Exact label'], ['input', ''], ['editor', 'full\ntext'], ['askDialog', { kind: 'chat' }], ['askDialog', { cancelled: true }], ['formDialog', { data: { count: 3, selected: ['native-value'] }, notes: [{ name: 'selected', value: 'native-value', text: 'Human context' }] }], ['formDialog', { cancelled: true }]]) {
     const item = decision({ method });
     const h = harness({ revision: 1, items: [item] });
     await h.store.connect(h.transport);
@@ -202,4 +203,21 @@ test('a helper conversation is visible only while shown and backed by a live gen
   assert.equal(renderedHelperAgentId(true, { id: 'helper', generation: 0 }), null);
   assert.equal(renderedHelperAgentId(true, undefined), null);
   assert.equal(renderedHelperAgentId(true, null), null);
+});
+
+test('native form drafts survive snapshots and human-only forms stay human-answerable until native timeout retirement', async () => {
+  const field = { kind: 'text', name: 'answer', label: [], type: 'text', value: 'default', multiline: false, required: false, placeholder: '', rows: 1 };
+  const item = decision({ method: 'formDialog', humanOnly: true, payload: { timeout: 1000, form: { fields: [field], hidden: [], sections: [{ title: [], fieldset: false, blocks: [{ kind: 'field', field }] }] } } });
+  const h = harness({ revision: 1, items: [item] });
+  await h.store.connect(h.transport);
+  const key = decisionKey(item.target);
+  assert.equal(canAnswer(item), true, 'human-only is not a restriction on the human inbox');
+  assert.equal(h.state().drafts.get(key).form[0].text, 'default');
+  h.store.updateDraft(item.target, draft => ({ ...draft, form: [{ ...draft.form[0], text: 'human draft' }] }));
+  h.emit({ revision: 2, items: [item] });
+  assert.equal(h.state().drafts.get(key).form[0].text, 'human draft');
+  h.emit({ revision: 3, items: [] });
+  await h.store.submit(item.target, { data: { answer: 'late answer' } });
+  assert.equal(h.answers.length, 0, 'native timeout retirement fences stale responses');
+  assert.equal(h.state().drafts.has(key), false);
 });

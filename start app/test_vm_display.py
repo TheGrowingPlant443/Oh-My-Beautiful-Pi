@@ -411,6 +411,28 @@ class RealSwayTests(_DisplayCase):
         with self.assertRaises(OSError):
             socket.create_connection(("127.0.0.1", display.vnc_port), timeout=2).close()
 
+    def test_viewer_keyboard_is_the_chosen_layout(self):
+        for keyboard, expected in (("default", "English (US)"), ("dk", "Danish")):
+            with self.subTest(keyboard=keyboard):
+                self.displays = HeadlessDisplays(self.root / f"private-{keyboard}", self.events.append, keyboard)
+                display = self.start(show=True)
+                client = _Rfb(display.vnc_port)
+                query = vm_display._Ipc(display.ipc_path)
+                try:
+                    layouts = []
+
+                    def connected():
+                        layouts[:] = [item.get("xkb_active_layout_name") for item in query.request(100)  # GET_INPUTS
+                                      if item["type"] == "keyboard"]
+                        return bool(layouts)
+                    # The viewer's virtual keyboard appears once its VNC client is connected.
+                    self.until(connected)
+                    self.assertEqual(layouts, [expected])
+                finally:
+                    query.close()
+                    client.close()
+                    display.terminate()
+
     def test_zenity_picker_floats_over_the_whole_output_and_follows_viewer_resizes(self):
         zenity = os.environ.get("START_APP_ZENITY")
         if not zenity:

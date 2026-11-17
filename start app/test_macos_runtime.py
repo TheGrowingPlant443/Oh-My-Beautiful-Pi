@@ -11,17 +11,17 @@ import subprocess
 import socket
 import time
 import threading
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import tarfile
 import tempfile
 import unittest
 
 from macos_runtime import (GIB, default_resources, validate_resources, verify_config,
                            prepare_lima_home, write_tree, _excluded_source, GuestSession, VmBackend, VmRun)
-from policy import Policy
-from runtime import OwnedChildren
+from policy import Policy, new_keyring_unlock
+from runtime import Cancelled, OwnedChildren
 from vm.guest import (discovery_home, extract_snapshot, GuestPolicy, installation_settings, prepare_descriptor_limit,
-                      retire_engine_sockets)
+                      retire_engine_sockets, Layout, Supervisor, receive_omp_copy)
 from vm.fetch_image import fetch
 from vm import emulation
 
@@ -243,16 +243,20 @@ class InstallationTransportTests(unittest.TestCase):
                 {"id": "nix-store", "label": "Store", "path": "/nix/store", "kind": "folder"},
                 {"id": "sandbox-run", "label": "Run", "path": "/run", "kind": "folder"}])
             saved = json.loads((backend.policy.directory / "requirements.json").read_text())
-            self.assertEqual([row.get("programs") for row in saved], [["gh"], None, None, None])
+            self.assertEqual([row.get("programs") for row in saved], [["gh"], None, None, None, None])
+            self.assertIn("omp-copy", [row["id"] for row in saved])
+            self.assertNotIn("host-omp", [row["id"] for row in saved])
             data = backend.policy.snapshot()
             data["disabled_requirements"] = ["package-gh", "nix-store", "sandbox-run"]
             backend.policy.replace(data)
             enabled = lambda rows: {row["id"]: row["enabled"] for row in rows}
             self.assertEqual(enabled(backend.requirements_status()),
-                             {"package-gh": True, "sandbox-tools": True, "nix-store": True, "sandbox-run": False})
+                             {"package-gh": True, "sandbox-tools": True, "omp-copy": True,
+                              "nix-store": True, "sandbox-run": False})
             inspection = {"installed_mode": False, "selected_packages": []}
             self.assertEqual(enabled(backend.requirements_status(inspection)),
-                             {"package-gh": False, "sandbox-tools": True, "nix-store": False, "sandbox-run": False})
+                             {"package-gh": False, "sandbox-tools": True, "omp-copy": True,
+                              "nix-store": False, "sandbox-run": False})
 
     def test_installed_launch_is_not_blocked_by_saved_inspection_programs(self):
         class Session:
@@ -280,12 +284,14 @@ class InstallationTransportTests(unittest.TestCase):
             self.assertEqual(backend.policy.snapshot()["programs"], data["programs"])
 
     def test_guest_start_revalidates_installation_and_discovery_home(self):
-        self.assertEqual(installation_settings({"installed_mode": True, "selected_packages": ["ssh", "gh", "ssh"]}),
-                         {"installed_mode": True, "selected_packages": ["gh", "ssh"]})
-        for value in (None, {"installed_mode": 1, "selected_packages": []},
-                      {"installed_mode": True, "selected_packages": ["/nix/store/x"]},
-                      {"installed_mode": True, "selected_packages": ["nixpkgs#hello"]},
-                      {"installed_mode": True, "selected_packages": [], "extra": 1}):
+        self.assertEqual(installation_settings({"installed_mode": True, "selected_packages": ["ssh", "gh", "ssh"],
+                                                "keyboard_layout": "dk"}),
+                         {"installed_mode": True, "selected_packages": ["gh", "ssh"], "keyboard_layout": "dk"})
+        valid = {"installed_mode": True, "selected_packages": [], "keyboard_layout": "default"}
+        for value in (None, {**valid, "installed_mode": 1}, {**valid, "selected_packages": ["/nix/store/x"]},
+                      {**valid, "selected_packages": ["nixpkgs#hello"]}, {**valid, "extra": 1},
+                      {"installed_mode": True, "selected_packages": []}, {**valid, "keyboard_layout": "us"},
+                      {**valid, "keyboard_layout": "dk --socket=/tmp/x"}):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 installation_settings(value)
         self.assertEqual(discovery_home("/host/Users/u"), "/host/Users/u")
@@ -293,6 +299,345 @@ class InstallationTransportTests(unittest.TestCase):
                       "host/Users/u", 5):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 discovery_home(value)
+
+
+class PrivateOmpTransportTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.home = self.root / "host"
+        self.source = self.home / ".omp"
+        self.source.mkdir(parents=True)
+        (self.source / "target").mkdir()
+        (self.source / "target" / "session").write_text("private session")
+        (self.source / ".git").mkdir()
+        (self.source / ".git" / "config").write_text("local configuration")
+        self.supervisor = object.__new__(Supervisor)
+        self.supervisor.layout = Layout(self.root / "guest").create()
+        self.supervisor.lock = threading.Lock()
+        self.supervisor.phase = "idle"
+        self.supervisor.run = None
+        self.supervisor.omp_copy = None
+        self.supervisor.policy = GuestPolicy(self.supervisor.layout.state, lambda event: None)
+        self.supervisor.keyring_backend = Mock()
+        self.key = new_keyring_unlock()
+        self.backend = object.__new__(VmBackend)
+        self.backend.policy = Policy(self.root / "host-state")
+        self.backend.home = self.root / "lima"
+        self.backend.wrapper = "/nix/store/test/bin/ombp-guest"
+        self.backend._ssh = Mock(return_value=["owned-ssh"])
+        self.backend.requirements = []
+        self.backend.lock = threading.Lock()
+        self.session = Mock()
+        self.session.request.side_effect = self.request
+        self.children = Mock()
+        self.children.popen.side_effect = self.receiver
+        self.log = io.BytesIO()
+        self.sent = b""
+
+    def tearDown(self):
+        self.supervisor.cancel()
+
+    def request(self, action, **args):
+        args.pop("timeout", None)
+        return getattr(self.supervisor, action)(args)
+
+    def receiver(self, command, **kwargs):
+        self.assertEqual(command[0], "owned-ssh")
+        token = self.supervisor.omp_copy.token
+        self.assertTrue(command[1].endswith("receive-omp-copy " + token))
+        owner = self
+
+        class Upload(io.BytesIO):
+            def close(self):
+                if not self.closed:
+                    owner.sent = self.getvalue()
+                    receive_omp_copy(owner.supervisor.layout, token, io.BytesIO(owner.sent))
+                super().close()
+
+        process = Mock()
+        process.stdin = Upload()
+        process.stdout = io.BytesIO(b"ok\n")
+        process.returncode = 0
+        self.transfer = process
+        return process
+
+    def copy(self):
+        with patch("macos_runtime.Path.home", return_value=self.home), \
+                patch("mac_network.keyring_unlock", return_value=self.key):
+            self.backend._copy_omp(self.session, self.children, self.log)
+
+    def begin(self, replace=False, request_id=None):
+        return self.supervisor.omp_copy_begin(
+            {"replace": replace, "request_id": request_id, "keyring_unlock": self.key})["token"]
+
+    def request_recopy(self, request_id="a" * 32):
+        pending = self.backend.policy.directory / "omp-recopy.json"
+        pending.write_text(json.dumps({"replace_previous": True, "request_id": request_id}))
+        pending.chmod(0o600)
+        return pending
+
+    def stage(self, token):
+        from omp_copy import write_snapshot
+        archive = io.BytesIO()
+        write_snapshot(archive, self.source)
+        data = archive.getvalue()
+        receive_omp_copy(self.supervisor.layout, token, io.BytesIO(data))
+        return hashlib.sha256(data).hexdigest()
+
+    def test_full_copy_then_restart_preserves_guest_edits_without_reading_source(self):
+        self.assertFalse(self.supervisor.omp_copy_status({})["copied"])
+        self.copy()
+        target = self.supervisor.layout.state / "home/.omp"
+        self.assertEqual((target / ".git/config").read_text(), "local configuration")
+        self.assertEqual((target / "target/session").read_text(), "private session")
+        self.assertTrue(self.supervisor.omp_copy_status({})["copied"])
+        self.session.request.assert_any_call("omp_copy_begin", replace=False, request_id=None,
+                                             keyring_unlock=self.key)
+        (target / "target/session").write_text("guest edit")
+        with patch("macos_runtime.write_snapshot", side_effect=AssertionError("source read")), \
+                patch("macos_runtime.Path.home", side_effect=AssertionError("home inspected")):
+            self.backend._copy_omp(self.session, self.children, self.log)
+        self.assertEqual((target / "target/session").read_text(), "guest edit")
+        self.children.adopt.assert_called_once_with(self.session.process, group=True)
+        self.children.release.assert_called_once_with(self.session.process)
+        self.assertNotIn(b"private session", self.log.getvalue())
+
+    def test_keyring_validation_precedes_staging_and_home_creation(self):
+        def validate(key):
+            self.assertEqual(key, self.key)
+            self.assertIsNone(self.supervisor.omp_copy)
+            self.assertFalse((self.supervisor.layout.state / "home").exists())
+            self.children.popen.assert_not_called()
+
+        self.supervisor.keyring_backend._keyring_password.side_effect = validate
+        self.copy()
+        self.supervisor.keyring_backend._keyring_password.assert_called_once_with(self.key)
+
+    def test_initial_copy_preserves_existing_authorized_guest_omp(self):
+        target = self.supervisor.layout.state / "home/.omp"
+        target.mkdir(parents=True)
+        (target / "existing").write_text("existing guest session")
+        self.copy()
+        self.assertEqual((target.with_name(".omp.previous") / "existing").read_text(), "existing guest session")
+        self.assertEqual((target / "target/session").read_text(), "private session")
+
+    def test_missing_host_source_is_marked_copied_and_never_overwritten_on_restart(self):
+        self.source.rename(self.home / "elsewhere")
+        self.copy()
+        target = self.supervisor.layout.state / "home/.omp"
+        self.assertTrue(self.supervisor.omp_copy_status({})["copied"])
+        self.assertEqual(list(target.iterdir()), [])
+        (target / "new-session").write_text("guest session")
+        with patch("macos_runtime.write_snapshot", side_effect=AssertionError("repeated copy")):
+            self.copy()
+        self.assertEqual((target / "new-session").read_text(), "guest session")
+
+    def test_explicit_recopy_consumes_receipt_only_after_success_and_replaces_backup(self):
+        self.copy()
+        target = self.supervisor.layout.state / "home/.omp"
+        (target / "target/session").write_text("previous guest edit")
+        previous = target.with_name(".omp.previous")
+        previous.mkdir()
+        (previous / "obsolete").write_text("older backup")
+        pending = self.request_recopy()
+        (self.source / "target/session").write_text("new host data")
+        self.copy()
+        self.assertFalse(pending.exists())
+        self.assertEqual((target / "target/session").read_text(), "new host data")
+        self.assertEqual((previous / "target/session").read_text(), "previous guest edit")
+        self.assertFalse((previous / "obsolete").exists())
+        self.assertEqual(self.supervisor.omp_copy_status({})["request_id"], "a" * 32)
+        self.session.request.assert_any_call("omp_copy_begin", replace=True, request_id="a" * 32,
+                                             keyring_unlock=self.key)
+
+    def assert_recopy_replay_preserves_previous(self, interrupted):
+        self.copy()
+        target = self.supervisor.layout.state / "home/.omp"
+        previous = target.with_name(".omp.previous")
+        (target / "target/session").write_bytes(b"original guest edits\x00\xff")
+        (target / "guest-only").write_bytes(b"must survive recopy retry")
+
+        def contents(directory):
+            return {path.relative_to(directory): path.read_bytes()
+                    for path in directory.rglob("*") if path.is_file()}
+
+        original = contents(target)
+        pending = self.request_recopy()
+        (self.source / "target/session").write_text("new host snapshot")
+        replace = os.replace
+
+        def interrupt_receipt(source, destination, **kwargs):
+            if source == "receipt" and destination == "omp-copy.json":
+                raise OSError("interrupted receipt publication")
+            return replace(source, destination, **kwargs)
+
+        def lose_acknowledgement(action, **args):
+            result = self.request(action, **args)
+            if action == "omp_copy_commit":
+                raise OSError("lost successful commit acknowledgement")
+            return result
+
+        fault = (patch("omp_copy.os.replace", side_effect=interrupt_receipt) if interrupted else
+                 patch.object(self.session, "request", side_effect=lose_acknowledgement))
+        with fault, patch("macos_runtime.terminate"), self.assertRaises(OSError):
+            self.copy()
+        self.assertEqual(json.loads(pending.read_text()),
+                         {"replace_previous": True, "request_id": "a" * 32})
+        self.assertEqual((self.supervisor.layout.state / ".omp-copy-pending.json").exists(), interrupted)
+        self.assertEqual(contents(previous), original)
+        self.assertEqual((target / "target/session").read_text(), "new host snapshot")
+        (target / "target/session").write_text("guest edits after publication")
+        self.session.request.reset_mock()
+        self.children.popen.reset_mock()
+        with patch("macos_runtime.write_snapshot", side_effect=AssertionError("source read")), \
+                patch("macos_runtime.Path.home", side_effect=AssertionError("home inspected")):
+            self.backend._copy_omp(self.session, self.children, self.log)
+        self.session.request.assert_called_once_with("omp_copy_status")
+        self.children.popen.assert_not_called()
+        self.assertFalse(pending.exists())
+        self.assertFalse((self.supervisor.layout.state / ".omp-copy-pending.json").exists())
+        self.assertEqual(self.supervisor.omp_copy_status({})["request_id"], "a" * 32)
+        self.assertEqual(contents(previous), original)
+        self.assertEqual((target / "target/session").read_text(), "guest edits after publication")
+
+        latest = contents(target)
+        pending = self.request_recopy("b" * 32)
+        (self.source / "target/session").write_text("next explicit snapshot")
+        self.copy()
+        self.assertFalse(pending.exists())
+        self.assertEqual(self.supervisor.omp_copy_status({})["request_id"], "b" * 32)
+        self.assertEqual(contents(previous), latest)
+        self.assertEqual((target / "target/session").read_text(), "next explicit snapshot")
+
+    def test_lost_successful_commit_acknowledgement_does_not_repeat_recopy(self):
+        self.assert_recopy_replay_preserves_previous(interrupted=False)
+
+    def test_interrupted_intent_recovers_on_next_status_without_repeating_recopy(self):
+        self.assert_recopy_replay_preserves_previous(interrupted=True)
+
+    def test_begin_rejects_inconsistent_or_invalid_request_identity(self):
+        for replace, request_id in ((True, None), (True, ""), (True, "A" * 32),
+                                    (True, "a" * 31), (True, 1), (False, "a" * 32),
+                                    (1, "a" * 32)):
+            with self.subTest(replace=replace, request_id=request_id), self.assertRaises(ValueError):
+                self.begin(replace, request_id)
+        self.assertIsNone(self.supervisor.omp_copy)
+        self.assertEqual(self.supervisor.phase, "idle")
+        self.supervisor.keyring_backend._keyring_password.assert_not_called()
+        self.assertEqual(list(self.supervisor.layout.root.glob("omp-incoming-*")), [])
+
+    def test_invalid_pending_request_is_not_upgraded_or_consumed(self):
+        self.copy()
+        pending = self.backend.policy.directory / "omp-recopy.json"
+        for value in ({"replace_previous": True}, {"replace_previous": True, "request_id": "invalid"}):
+            with self.subTest(value=value):
+                pending.write_text(json.dumps(value))
+                pending.chmod(0o600)
+                with patch("macos_runtime.Path.home", side_effect=AssertionError("home inspected")), \
+                        self.assertRaises(ValueError):
+                    self.backend._copy_omp(self.session, self.children, self.log)
+                self.assertEqual(json.loads(pending.read_text()), value)
+
+    def test_failed_transfer_never_commits_or_consumes_recopy(self):
+        pending = self.request_recopy()
+        self.children.release.side_effect = Cancelled("cancelled release")
+        with patch("macos_runtime.write_snapshot", side_effect=Cancelled("cancelled")), \
+                patch("macos_runtime.terminate"):
+            with self.assertRaises(Cancelled):
+                self.copy()
+        self.assertTrue(pending.exists())
+        self.assertEqual(json.loads(pending.read_text())["request_id"], "a" * 32)
+        self.assertFalse(self.supervisor.omp_copy_status({})["copied"])
+        self.assertEqual(self.supervisor.phase, "idle")
+        self.assertNotIn("omp_copy_commit", [call.args[0] for call in self.session.request.call_args_list])
+        self.assertTrue(self.transfer.stdin.closed)
+        self.assertTrue(self.transfer.stdout.closed)
+
+    def test_staged_archive_requires_live_session_commit_and_matching_digest(self):
+        token = self.begin()
+        digest = self.stage(token)
+        self.assertFalse(self.supervisor.omp_copy_status({})["copied"])
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.supervisor.omp_copy_commit({"token": token, "digest": "0" * 64})
+        self.assertFalse(self.supervisor.omp_copy_status({})["copied"])
+        with self.assertRaisesRegex(ValueError, "no longer owned"):
+            self.supervisor.omp_copy_commit({"token": token, "digest": digest})
+
+    def test_cancellation_invalidates_receiver_and_stale_commit(self):
+        token = self.begin()
+        digest = self.stage(token)
+        self.supervisor.cancel()
+        with self.assertRaises(OSError):
+            receive_omp_copy(self.supervisor.layout, token, io.BytesIO(b"stale"))
+        with self.assertRaisesRegex(ValueError, "no longer owned"):
+            self.supervisor.omp_copy_commit({"token": token, "digest": digest})
+        self.assertFalse(self.supervisor.omp_copy_status({})["copied"])
+
+    def test_copy_cannot_race_active_guest_or_another_copy(self):
+        self.supervisor.phase = "running"
+        with self.assertRaisesRegex(ValueError, "idle"):
+            self.begin()
+        self.supervisor.phase = "idle"
+        self.begin()
+        with self.assertRaisesRegex(ValueError, "idle"):
+            self.begin()
+        snapshot_id = "b" * 32
+        (self.supervisor.layout.snapshots / snapshot_id).mkdir()
+        with self.assertRaisesRegex(ValueError, "already copying"):
+            self.supervisor.start({
+                "source_snapshot_id": snapshot_id, "desktop": False, "gpu": "none", "agent": "omsp",
+                "keyring_unlock": self.key, "proxy_ca": "not used", "workspace": None,
+                "installation": {"installed_mode": True, "selected_packages": [], "keyboard_layout": "default"},
+                "git_discovery_home": "/host/Users/example"})
+
+    def test_stop_during_install_checks_cancellation_before_publish(self):
+        token = self.begin()
+        digest = self.stage(token)
+
+        def interrupted(stream, state, replace, request_id, check):
+            self.assertEqual(state, self.supervisor.layout.state)
+            self.assertIsNone(request_id)
+            self.supervisor.cancel()
+            check()
+            self.fail("installation survived cancellation")
+
+        with patch("vm.guest.install_snapshot", side_effect=interrupted), self.assertRaises(Cancelled):
+            self.supervisor.omp_copy_commit({"token": token, "digest": digest})
+        self.assertFalse(self.supervisor.omp_copy_status({})["copied"])
+        self.assertEqual(self.supervisor.phase, "idle")
+
+    def test_keyring_validation_failure_prevents_initial_copy(self):
+        home = self.supervisor.layout.state / "home"
+        home.mkdir()
+        (home / "existing").write_text("private")
+        self.supervisor.keyring_backend._keyring_password.side_effect = ValueError("no keyring unlock key")
+        with self.assertRaisesRegex(ValueError, "no keyring unlock key"):
+            self.begin()
+        self.assertIsNone(self.supervisor.omp_copy)
+        self.supervisor.keyring_backend._keyring_password.assert_called_once_with(self.key)
+        self.assertEqual((home / "existing").read_text(), "private")
+
+    def test_missing_legacy_requirement_is_added_and_cannot_be_revoked(self):
+        self.backend._save_requirements([])
+        self.assertEqual([row["id"] for row in self.backend.requirements_status()], ["omp-copy"])
+        data = self.backend.policy.snapshot()
+        data["disabled_requirements"] = ["omp-copy", "host-omp"]
+        self.backend.policy.replace(data)
+        self.assertTrue(self.backend.requirements_status()[0]["enabled"])
+
+    def test_overlapping_host_state_is_rejected_before_sending(self):
+        self.backend.policy = Policy(self.source / "launcher-state")
+        with self.assertRaisesRegex(ValueError, "must not overlap"):
+            self.copy()
+        self.children.popen.assert_not_called()
+
+    def test_overlapping_vm_state_is_rejected_before_sending(self):
+        self.backend.home = self.source / "vm"
+        with self.assertRaisesRegex(ValueError, "must not overlap"):
+            self.copy()
+        self.children.popen.assert_not_called()
 
 
 class FailureBoundaryTests(unittest.TestCase):
@@ -480,7 +825,8 @@ supervisor.serve()
             try:
                 session.request("start", source_snapshot_id="a" * 32, desktop=False, gpu="none",
                                 agent="omp", keyring_unlock="test", proxy_ca="test", workspace=None,
-                                installation={"installed_mode": True, "selected_packages": ["gh"]},
+                                installation={"installed_mode": True, "selected_packages": ["gh"],
+                                              "keyboard_layout": "default"},
                                 git_discovery_home="/host/Users/u")
                 self.assertTrue(ready.wait(5))
                 self.assertEqual(session.request("status")["phase"], "building")

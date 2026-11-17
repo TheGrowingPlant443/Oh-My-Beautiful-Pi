@@ -12,6 +12,7 @@
 <div id="installed-controls"><label class="check"><input id="installed-mode" type="checkbox" checked>Install into container</label><button id="choose-packages" class="secondary" type="button" disabled>Choose tools…</button></div>
 </section>
 <p id="boundary" class="notice">Container mode: OMBP and every OMP child run together. Only approved host resources are exposed. Network requests must pass the website gateway.</p>
+<section id="omp-copy-controls" class="notice" aria-label="Private OMP copy"><strong>Private ~/.omp · copy once</strong><p>The first isolated Start copies your entire host ~/.omp, including credentials, .env, Git history, ignored files and custom folders. macOS uses the Linux VM; Linux uses its private container home. Later starts keep container changes. Nothing is written back to the host.</p><p class="fine">The container can read copied credentials. External symlinks are preserved but may dangle; sockets, FIFOs and devices cannot be copied as live endpoints and are counted in the launch log. Git push still needs usable credentials and allowed network access.</p><button id="omp-copy-again" class="secondary" type="button">Copy again on next Start…</button><span id="omp-copy-state" aria-live="polite"></span></section>
 <p id="message" role="alert" aria-live="polite"></p>
 <div id="desktops" class="desktops" aria-label="Isolated displays" hidden></div>
 <main>
@@ -39,6 +40,10 @@
 <p>The selected OMP/OMSP CLI and OMBP, including Bun, Node, Git, source-index Python and keyring tools; sandbox Python, Bash/sh, coreutils, D-Bus, private keyring, fonts, Podman client and the Zenity picker. AMD launches on Linux also include Mesa.</p>
 <p class="fine">Pinned local servers, toolchains, checkers and debugger adapters. Their runtime dependencies are included; project libraries, lockfiles and debug targets remain project-specific. Hover a choice to see its commands. Package selection is not a per-binary restriction. Host folder grants and the network gateway still apply. Leave every optional package unchecked for core only.</p>
 <div id="package-groups"></div>
+<fieldset id="keyboard-controls" hidden><legend>Keyboard in the OMBP window</legend>
+<label>Layout <select id="keyboard-layout"><option value="default">Current (US English)</option><option value="dk">Danish</option></select></label>
+<p class="fine">Choose the layout of the keyboard you type on. Danish makes æ, ø, å and the other Danish keys arrive correctly in the isolated window.</p>
+</fieldset>
 <p id="package-error" role="alert"></p>
 <div class="actions"><button id="package-cancel" class="secondary" type="button">Cancel</button><button id="package-save" type="submit">Save selection</button></div>
 </form>

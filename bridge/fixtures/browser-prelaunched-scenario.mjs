@@ -88,11 +88,11 @@ export default async function prelaunchedScenario(pi) {
       const manual=manualTargets.find(target=>target.title==='Manual A');
       const read=await cell(`var mine=browser.tab(${JSON.stringify(manual.tab)});await mine.evaluate(()=>{document.body.dataset.agent="attached";});print("FLOW:"+JSON.stringify({title:await mine.title(),marker:await mine.evaluate(()=>document.body.dataset.agent)}));`);
       assert.deepEqual(read,{title:'Manual A',marker:'attached'},'The agent must control the button-opened page by target tab name');
-      const adopted=await cell(`var adopted=await browser.open({name:"manual",app:{target:${JSON.stringify(manual.target)}}});print("FLOW:"+JSON.stringify({title:await adopted.title(),marker:await adopted.evaluate(()=>document.body.dataset.agent)}));`);
+      const adopted=await cell(`var adopted=await browser.open({name:"manual",target:${JSON.stringify(manual.target)}});print("FLOW:"+JSON.stringify({title:await adopted.title(),marker:await adopted.evaluate(()=>document.body.dataset.agent)}));`);
       assert.deepEqual(adopted,{title:'Manual A',marker:'attached'},'A discovered target must adopt the existing page, without navigating it');
       assert.deepEqual(await pageIds(),originalPages,'adoption must preserve the button-opened pages');
       manualRows.find(row=>row.name===manual.tab).name='manual';
-      const refused=await cell('var errors=[];for(var app of [{relay:true},{tern:true},{cdp_url:"http://127.0.0.1:1"},{path:"chrome"}]){try{await browser.targets({app});}catch(error){errors.push(error.message);}}print("FLOW:"+JSON.stringify({errors}));');
+      const refused=await cell('var errors=[];for(var app of ["relay","tern","http://127.0.0.1:1","chrome"]){try{await browser.targets({app});}catch(error){errors.push(error.message);}}print("FLOW:"+JSON.stringify({errors}));');
       assert.equal(refused.errors.length,4);
       assert.ok(refused.errors.every(error=>error.includes("OMP Manager owns this terminal")));
       // The agent's own tab still works next to them.

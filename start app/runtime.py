@@ -13,6 +13,8 @@ import time
 import traceback
 import uuid
 
+from omp_copy import read_copy_request
+
 STORE = "/nix/store/"
 # Shipped Nix invocations must work on a fresh Nix without changing the user's global configuration.
 NIX = ("nix", "--extra-experimental-features", "nix-command flakes")
@@ -247,6 +249,7 @@ class Runtime:
                     "operation_started": last.started if last else None,
                     "launch": dict(self.launch) if self.launch else None,
                     "container": self.isolated.container if self.isolated else None,
+                    "omp_copy_pending": (self.policy.directory / "omp-recopy.json").exists(),
                     "error": self.last_error, **extra}
 
     def log_origin(self):
@@ -282,6 +285,24 @@ class Runtime:
                   and operation.settings["mode"] != "normal" else None)
         return self.isolated.requirements_status(active)
 
+    def copy_omp_again(self, confirmation):
+        """Authorize one replacement at the next isolated Start, never during a live operation."""
+        if confirmation is not True:
+            raise ValueError("Confirm replacement of the private OMP copy and its previous backup")
+        with self.lock:
+            if self.closing or self.operation is not None:
+                raise ValueError("Stop OMBP and wait for it to finish before requesting Copy again")
+            if self.isolated is None:
+                raise ValueError("Private OMP copies require an isolated backend")
+            if read_copy_request(self.policy.directory) is None:
+                self.policy.save("omp-recopy.json", {"replace_previous": True, "request_id": uuid.uuid4().hex})
+                # Persist the directory entry before any backend can apply this authorization.
+                descriptor = os.open(self.policy.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+
     @staticmethod
     def _launch_source(source, mode, desktop, gpu, agent):
         """The resolved OMBP checkout, once every launch setting is valid."""
@@ -311,7 +332,7 @@ class Runtime:
         settings = {"source": str(source), "mode": mode, "desktop": desktop, "gpu": gpu, "agent": agent}
         # Captured now: tool choices saved while this launch prepares or runs apply only to the next Start.
         installation = (self.policy.installation() if mode != "normal"
-                        else {"installed_mode": False, "selected_packages": []})
+                        else {"installed_mode": False, "selected_packages": [], "keyboard_layout": "default"})
         return self._admit(Operation(0, settings, installation=installation), backend, mode)
 
     def prepare(self):

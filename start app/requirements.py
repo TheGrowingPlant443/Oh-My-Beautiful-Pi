@@ -47,15 +47,17 @@ FOLDERS = (
     ("network-socket", "Whitelist gateway socket", "/network"),
     ("proxy-ca", "Whitelist HTTPS certificate", "/trust/ca.pem"),
     ("nix-store", "Approved Nix runtime files", "/nix/store"),
-    ("host-omp", "Your OMP folder (~/.omp), shared read-write with host OMP", "/home/sandbox/.omp"),
+    ("omp-copy", "Private OMP folder (full host copy once, then independent)", "/home/sandbox/.omp"),
     ("sonar-engine", "SonarQube engine (filtered host Podman)", "/engine"),
 )
 
 
 def requirement_enabled(item, installed, disabled):
-    """Installed mode copies its programs and their store files privately, so inspection revocations of program
-    bundles and of the filtered Nix store do not apply to it; every other requirement keeps its saved switch."""
-    return (installed and (item["kind"] == "program" or item["id"] == "nix-store")) or item["id"] not in disabled
+    """The private OMP copy is persistent state, not a revocable host mount. Installed mode also includes
+    its private programs/store regardless of inspection switches; other requirements keep their saved switch."""
+    return (item["id"] == "omp-copy"
+            or (installed and (item["kind"] == "program" or item["id"] == "nix-store"))
+            or item["id"] not in disabled)
 
 
 def store_root(path):

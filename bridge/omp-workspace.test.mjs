@@ -200,6 +200,21 @@ test('a streaming-entry workspace failure still rejects provider admission', asy
   } finally { await f.workspace.dispose(); }
 });
 
+test('an unrecoverable workspace realignment forces native shutdown without an extension veto', async () => {
+  const f = await workspaceFixture();
+  const closes = [];
+  try {
+    f.mode.applyCwdChange = async () => false;
+    f.mode.shutdown = async options => closes.push(options);
+    await f.workspace.control('workspace_change', f.change);
+    f.mode.session.isStreaming = true;
+    await assert.rejects(f.beforeModel(), /Workspace rollback failed/);
+    assert.deepEqual(closes, [{ cancellable: false }]);
+    assert.equal(f.records.some(record => record.action === 'workspace_ready'), false);
+    assert.equal(f.records.at(-1).action, 'workspace_failed');
+  } finally { await f.workspace.dispose(); }
+});
+
 test('Markdown admission rechecks replacement holds without delaying an unheld native prompt', async () => {
   const f = await workspaceFixture();
   let blocked;

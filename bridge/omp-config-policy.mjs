@@ -79,9 +79,11 @@ function slotSource(manifest, entry, selection) {
 }
 
 function guardSettings(utility, hasSources) {
-  if (utility) return { skills: { enabled: false, customDirectories: [] }, extensions: [],
+  // Native worker threads re-import extensions without the process-local session/resource authorization maps.
+  const threadPolicy = process.env.OMBP_AGENT === 'omsp' ? {} : { task: { workerThreads: 0 } };
+  if (utility) return { ...threadPolicy, skills: { enabled: false, customDirectories: [] }, extensions: [],
     advisor: { enabled: false }, autolearn: { enabled: false }, prewalk: { enabled: false }, ttsr: { enabled: false } };
-  return hasSources ? { skills: { customDirectories: [] } } : {};
+  return { ...threadPolicy, ...(hasSources ? { skills: { customDirectories: [] } } : {}) };
 }
 
 async function renderSlots(manifest, selection, root, definitions, snapshots = new Map()) {

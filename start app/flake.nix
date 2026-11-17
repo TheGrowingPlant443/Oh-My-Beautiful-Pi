@@ -252,12 +252,12 @@
       };
     });
     devShells = eachLinux (system: let inherit (linux system) pkgs testPython runtimeInputs hostEnv guestEnv; in {
-      default = pkgs.mkShell ({ packages = [ testPython ] ++ builtins.tail runtimeInputs; } // hostEnv // guestEnv);
+      default = pkgs.mkShell ({ packages = [ testPython pkgs.git ] ++ builtins.tail runtimeInputs; } // hostEnv // guestEnv);
     }) // eachDarwin (system: let inherit (darwin system) pkgs testPython runtimeInputs hostEnv; in {
-      # GNU cp is test-only here: the private-installation tests need its reflink/ownership flags,
-      # while installation itself runs in the Linux guest. The shipped controller does not include it.
+      # GNU cp and Git are test-only here: private-installation tests need GNU flags,
+      # and synthetic repository tests must not depend on Apple's xcrun Git shim.
       default = pkgs.mkShell ({
-        packages = [ testPython pkgs.coreutils ] ++ builtins.tail runtimeInputs;
+        packages = [ testPython pkgs.coreutils pkgs.git ] ++ builtins.tail runtimeInputs;
         START_APP_COREUTILS = "${pkgs.coreutils}/bin";
       } // hostEnv);
     });

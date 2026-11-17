@@ -209,6 +209,14 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| format!("{key} is required"))
 }
 
+fn native_srs_answer(method: &str, answer: Value) -> Result<Value> {
+    match method {
+        "formDialog" => Ok(json!({"srsAnswer":answer})),
+        "askDialog" => Ok(json!({"kind":"submit","results":[answer]})),
+        _ => Err("native_terminal_decision".into()),
+    }
+}
+
 impl ManagerHub {
     pub fn bind(extension_path: PathBuf) -> Result<Arc<Self>> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
@@ -374,7 +382,7 @@ impl ManagerHub {
         &self,
         producer: &DependencyProducer,
         invocation: &str,
-        response: Value,
+        answer: Value,
     ) -> Result<Value> {
         let decision = self
             .state
@@ -389,6 +397,7 @@ impl ManagerHub {
             })
             .cloned()
             .ok_or("decision_already_resolved")?;
+        let response = native_srs_answer(text(&decision.payload, "method")?, answer)?;
         let target = HumanDecisionTarget {
             instance_id: decision.worker,
             request_id: decision.public_id,
@@ -596,7 +605,7 @@ impl ManagerHub {
                 repository: decision.repository,
                 answerable: matches!(
                     method.as_str(),
-                    "approve" | "confirm" | "select" | "input" | "editor" | "askDialog"
+                    "approve" | "confirm" | "select" | "input" | "editor" | "askDialog" | "formDialog"
                 ),
                 human_only: decision.payload["humanOnly"].as_bool().unwrap_or(false),
                 method,
@@ -685,7 +694,7 @@ impl ManagerHub {
         }
         if !matches!(
             decision.payload["method"].as_str(),
-            Some("approve" | "confirm" | "select" | "input" | "editor" | "askDialog")
+            Some("approve" | "confirm" | "select" | "input" | "editor" | "askDialog" | "formDialog")
         ) {
             return Err("native_terminal_decision".into());
         }
@@ -1539,7 +1548,9 @@ impl ManagerHub {
             return Err("stale_generation".into());
         }
         let mut repository = self.decision_repository(&registry, &actor.id)?;
-        if actor.role == InstanceKind::Architect && payload["method"] == "askDialog" {
+        if actor.role == InstanceKind::Architect
+            && matches!(payload["method"].as_str(), Some("askDialog" | "formDialog"))
+        {
             if let Some(service) = self.srs.get().and_then(Weak::upgrade) {
                 let producer = self.dependency_producer(&actor.id, actor.generation)?;
                 if let Some(folder) = service.native_question_repository(&producer, base)? {
@@ -2656,6 +2667,22 @@ impl crate::agent_markdown::MarkdownBoundary for HubMarkdownBoundary {
 mod tests {
     use super::*;
     #[test]
+    fn srs_answers_keep_native_form_and_fork_dialog_contracts() {
+        let answer = json!({"id":"question","selectedOptions":["JSON"],"customInput":null,"note":"Required by the customer"});
+        assert_eq!(
+            native_srs_answer("formDialog", answer.clone()).unwrap(),
+            json!({"srsAnswer":answer.clone()})
+        );
+        assert_eq!(
+            native_srs_answer("askDialog", answer.clone()).unwrap(),
+            json!({"kind":"submit","results":[answer]})
+        );
+        assert_eq!(
+            native_srs_answer("custom", json!({})).unwrap_err(),
+            "native_terminal_decision"
+        );
+    }
+    #[test]
     fn coordinator_report_and_decision_context_use_the_original_project() {
         let folder =
             std::env::temp_dir().join(format!("omp-logical-project-{}", uuid::Uuid::new_v4()));
@@ -2745,8 +2772,15 @@ mod tests {
                     &json!({"sessionId":row.id,"supported":true,"workspaceEpoch":0}),
                 )
                 .unwrap();
-            hub.register_decision(&Actor { id: row.id.clone(), generation: 0, role: row.kind, connection_id: String::new() },
-                &json!({"requestId":"native-base","method":"confirm","sessionId":row.id,"workspaceEpoch":0,"createdAt":1,"title":"Confirm","message":"Proceed?","humanOnly":true})).unwrap();
+            let mut payload = json!({"requestId":"native-base","method":"confirm","sessionId":row.id,"workspaceEpoch":0,"createdAt":1,"title":"Confirm","message":"Proceed?","humanOnly":true});
+            if row.id == worker.id {
+                payload["method"] = json!("formDialog");
+                payload["html"] = json!("<input name=\"answer\" type=\"number\" value=\"42\">");
+                let field = json!({"kind":"text","name":"answer","type":"number","multiline":false,"label":[{"text":"answer"}],"value":"42","placeholder":"","required":false,"rows":1});
+                payload["form"] = json!({"sections":[{"title":[],"blocks":[{"kind":"field","field":field.clone()}],"fieldset":false}],"fields":[field],"hidden":[]});
+                payload["defaults"] = json!({"answer":42});
+            }
+            hub.register_decision(&Actor { id: row.id.clone(), generation: 0, role: row.kind, connection_id: String::new() }, &payload).unwrap();
         }
         let initial = hub.human_decisions().unwrap();
         assert_eq!(initial.items.len(), 5);
@@ -2762,6 +2796,10 @@ mod tests {
         );
         assert!(decision.payload.get("requestId").is_none());
         assert!(decision.answerable && decision.human_only);
+        assert_eq!(decision.method, "formDialog");
+        assert_eq!(decision.payload["html"], "<input name=\"answer\" type=\"number\" value=\"42\">");
+        assert_eq!(decision.payload["form"]["fields"][0]["name"], "answer");
+        assert_eq!(decision.payload["defaults"]["answer"], 42);
         for id in [&helper.id, &plan.id] {
             assert_eq!(
                 initial
@@ -2809,7 +2847,7 @@ mod tests {
                 &target.request_id,
                 0,
                 None,
-                json!(true),
+                json!({"data":{"answer":42}}),
                 Origin::Manager(&manager.id)
             )
             .unwrap_err(),
@@ -2817,7 +2855,12 @@ mod tests {
         );
         // A human passes ownership gates without transferring the worker. No live bridge in this fixture.
         assert_eq!(
-            hub.respond_human_decision(&target, json!(false))
+            hub.respond_human_decision(&target, json!({"data":{"answer":42}}))
+                .unwrap_err(),
+            "bridge_not_ready"
+        );
+        assert_eq!(
+            hub.respond_human_decision(&target, json!({"cancelled":true}))
                 .unwrap_err(),
             "bridge_not_ready"
         );

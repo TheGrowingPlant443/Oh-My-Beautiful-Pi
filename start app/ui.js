@@ -62,7 +62,7 @@ function entry(list, label, detail, remove, enabled = true) {
 const REQUIREMENT_NOTES = {
   program: "Read-only Nix bundle; removal may break OMBP",
   "sandbox-browser": "Opens browsers in their own nested window; closes with the last browser",
-  "host-omp": "Host files; container can change them; restart to revoke",
+  "omp-copy": "Copied once with credentials; container changes stay private; no host mount",
   "sonar-engine": "Only OMBP's SonarQube containers on host Podman; restart to revoke",
   folder: "Private sandbox files; restart to revoke",
 };
@@ -123,6 +123,9 @@ function openPackageDialog() {
     label.append(input, text);
     fieldsets.get(choice.group).append(label);
   }
+  // Only the Linux VM's viewer translates keys; a Linux host's nested desktop already follows the host layout.
+  byId("keyboard-controls").hidden = catalog.program_domain !== "linux-vm";
+  byId("keyboard-layout").value = state.policy.keyboard_layout;
   byId("package-error").textContent = catalog.packages.length ? "" : "Package catalog unavailable. Reload the launcher to try again.";
   byId("package-save").disabled = !catalog.packages.length || transitioning();
   dialog.showModal();
@@ -171,6 +174,10 @@ function renderRequirementList(kind, installed) {
   list.replaceChildren();
   for (const requirement of state.requirements || []) {
     if (requirement.kind !== kind || installed && kind === "program") continue;
+    if (requirement.id === "omp-copy") {
+      entry(list, requirement.label, `${requirement.path} · ${REQUIREMENT_NOTES["omp-copy"]}`);
+      continue;
+    }
     if (installed && requirement.id === "nix-store") {
       entry(list, requirement.label, `${requirement.path} · Required private installed store; read-only`);
       continue;
@@ -731,6 +738,10 @@ async function refresh() {
   byId("start").disabled = active;
   byId("prepare").disabled = active;
   byId("stop").disabled = !(runtime.starting || runtime.phase === "running");
+  byId("omp-copy-again").disabled = active || !!runtime.omp_copy_pending;
+  byId("omp-copy-state").textContent = runtime.omp_copy_pending
+    ? " Copy again is queued for the next isolated Start; the existing .omp.previous backup will be replaced."
+    : " Ordinary starts preserve your private copy.";
   for (const id of ["mode", "gpu", "desktop", "source", "agent"]) byId(id).disabled = active;
   if (running && runtime.launch) {
     byId("mode").value = runtime.mode;
@@ -801,10 +812,11 @@ byId("package-form").onsubmit = event => {
   }
   action(async () => {
     const selected = [...byId("package-groups").querySelectorAll("input:checked")].map(input => input.value);
+    const keyboard = byId("keyboard-layout").value;
     byId("package-save").disabled = true;
     byId("package-error").textContent = "";
     try {
-      await change(policy => { policy.selected_packages = selected; });
+      await change(policy => { policy.selected_packages = selected; policy.keyboard_layout = keyboard; });
       byId("package-dialog").close();
     } catch (error) {
       byId("package-error").textContent = error.message || error;
@@ -831,10 +843,17 @@ byId("allow-all-network").onclick = () => action(async () => {
   await change(policy => { policy.allow_all_network = enable; });
 });
 byId("gpu").onchange = () => { gpuChosen = true; };
+byId("omp-copy-again").onclick = () => action(async () => {
+  if (!confirm("Copy your entire host ~/.omp again on the next isolated Start, including credentials?\n\n" +
+      "The active private copy becomes .omp.previous. Any existing .omp.previous backup is permanently replaced. " +
+      "The host is never changed. Stop OMBP first. Continue?")) return;
+  await api("omp-copy", {replace_previous: true});
+});
 function renderMode() {
   const normal = byId("mode").value === "normal";
   const operating = !!state && !["stopped", "failed"].includes(state.runtime.phase);
   byId("installed-controls").hidden = normal;
+  byId("omp-copy-controls").hidden = normal;
   byId("installed-mode").disabled = normal || !state || operating;
   byId("choose-packages").disabled = normal || !state || transitioning()
     || !state.policy.installed_mode || !catalog.packages.length;

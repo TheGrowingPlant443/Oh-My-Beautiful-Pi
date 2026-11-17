@@ -69,6 +69,49 @@ test('an active visualization turn allows only request-bound reads, the matching
   }
 });
 
+for (const mode of ['visualization', 'srs', 'monitor']) test(`${mode} native form media uses the current Ask/read policy before any resource access`, () => {
+  const guard = createVisualizationGuard();
+  const { ctx } = fakeContext('session-a', { agent: { kind: 'main', id: 'Main' } });
+  const stage = { jobId: SYSTEM, attemptId: SYSTEM, stageId: SYSTEM, nonce: 'stage-nonce', phase: 'survey', message: 'Inspect.' };
+  const text = mode === 'srs' ? guard.admitSrs(ctx, stage).text : mode === 'monitor'
+    ? guard.admitMonitor(ctx, { requestId: SYSTEM, snapshotId: 'snapshot', message: 'Explain.' }).text : admit(guard, ctx);
+  const actor = { kind: 'main', id: 'Main' };
+  assert.doesNotThrow(() => guard.authorizeFormMedia(ctx, actor, ['https://example.test/pending.png']), 'pending authorization does not own unrelated work');
+  guard.beforeAgentStart({ prompt: text }, ctx);
+  assert.doesNotThrow(() => guard.authorizeFormMedia(ctx, actor, []), 'plain forms and self-contained data media need no external read');
+  const events = [], toolCall = guard.toolCall;
+  guard.toolCall = (event, context) => { events.push(event); return toolCall(event, context); };
+  for (const source of ['https://example.test/pixel.png', '/outside/evidence.png', 'file:///outside/evidence.png', 'svg:resource-capable']) {
+    assert.throws(() => guard.authorizeFormMedia(ctx, actor, [source]), /Analysis form media refused/);
+    assert.deepEqual(events.splice(0), [{ toolName: 'ask', input: {} }, { toolName: 'read', input: { path: source } }]);
+  }
+  assert.doesNotThrow(() => guard.authorizeFormMedia(ctx, { kind: 'unattributed' }, []), 'raw root Ask remains available');
+  assert.throws(() => guard.authorizeFormMedia(ctx, { kind: 'unattributed' }, ['https://example.test/raw.png']), /Analysis form media refused/);
+  for (const origin of [{ kind: 'sub', id: 'Child' }, { kind: 'advisor', id: 'Advisor' }, { kind: 'main', id: 'Other' }]) {
+    assert.throws(() => guard.authorizeFormMedia(ctx, origin, []), /Only the main Architect/);
+  }
+  assert.throws(() => guard.authorizeFormMedia(fakeContext('child-session', { agent: { kind: 'sub' } }).ctx, actor, []), /main session context/);
+  assert.equal(guard.states().length, 1, 'a child context cannot prune the root guard');
+  guard.beforeAgentStart({ prompt: 'unrelated prompt awaiting the provider barrier' }, ctx);
+  assert.throws(() => guard.authorizeFormMedia(ctx, actor, []), /uncertain or paused/, 'revalidation before native UI observes changed authority');
+  guard.release();
+  assert.doesNotThrow(() => guard.authorizeFormMedia(ctx, { kind: 'sub' }, ['https://example.test/ordinary.png']), 'ordinary unguarded forms retain native media support');
+});
+
+test('native form authorization rejects paused and submitted stages even without media', () => {
+  const { ctx } = fakeContext();
+  const actor = { kind: 'main' };
+  const paused = createVisualizationGuard();
+  const stage = { jobId: SYSTEM, attemptId: SYSTEM, stageId: SYSTEM, nonce: 'stage-nonce', phase: 'survey', message: 'Inspect.' };
+  paused.beforeAgentStart({ prompt: paused.admitSrs(ctx, stage).text }, ctx);
+  paused.pauseSrs(ctx, stage);
+  assert.throws(() => paused.authorizeFormMedia(ctx, actor, []), /uncertain or paused/);
+  const submitted = createVisualizationGuard();
+  submitted.beforeAgentStart({ prompt: admit(submitted, ctx) }, ctx);
+  submitted.toolResult({ toolName: TOOLS.systemSubmit, input: { requestId: SYSTEM }, isError: false }, ctx);
+  assert.throws(() => submitted.authorizeFormMedia(ctx, actor, []), /complete/);
+});
+
 test('structure kinds are bound to the structure submitter and the nested tool inputs cannot spoof another request', () => {
   const guard = createVisualizationGuard();
   const { ctx } = fakeContext();

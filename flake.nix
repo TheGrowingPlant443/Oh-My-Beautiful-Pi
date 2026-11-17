@@ -23,11 +23,9 @@
         let
           inherit (pkgs) lib stdenv;
           craneLib = crane.mkLib pkgs;
-          # Intel's final Nixpkgs Bun predates the SDK's minimum; reuse the
-          # compatible Bun already pinned and built by OMSP for that platform.
-          bun = if stdenv.hostPlatform.system == "x86_64-darwin" then
-            omsp.packages.x86_64-darwin.sdk.bun
-          else pkgs.bun;
+          # The SDK needs Bun >= 1.4.4, newer than this Nixpkgs pin (and than Intel macOS's final one);
+          # reuse the compatible Bun that OMSP already pins and builds for every platform.
+          bun = omspSdk.bun;
           sdk = import ./nix/omp-sdk { inherit pkgs; };
           sdkCommand = pkgs.writeShellScript "omp-manager-cli" ''
             unset PI_COMPILED
@@ -266,6 +264,7 @@
                 --set-default OMP_SYSTEM_OVERVIEW_PYTHON ${sourceIndexPython}/bin/python3
                 --set-default OMP_SDK_DIR ${sdk}/node_modules/@oh-my-pi/pi-coding-agent
                 --set-default OMP_BIN ${sdkCommand}
+                --set-default BUN_BIN ${bun}/bin/bun
               )
             '' + lib.optionalString stdenv.hostPlatform.isLinux ''
               makeWrapperArgs+=( "''${gappsWrapperArgs[@]}" )
@@ -326,6 +325,7 @@
             OMP_SYSTEM_OVERVIEW_PYTHON = "${sourceIndexPython}/bin/python3";
             OMP_SDK_DIR = "${sdk}/node_modules/@oh-my-pi/pi-coding-agent";
             OMP_BIN = "${sdkCommand}";
+            BUN_BIN = "${bun}/bin/bun";
             OMP_COVERAGE_PYTHON = "${coveragePython}/bin/python3";
             OMP_TEST_NODE_MODULES = "${testNodeModules}/node_modules";
             OMP_TEST_REQUIRE_ALL_GRAMMARS = "1";

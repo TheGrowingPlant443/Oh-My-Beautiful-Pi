@@ -57,7 +57,9 @@ async function managedSettings(files, defaultPath, selection, overrides = {}) {
   await chmod(directory, 0o700);
   const prepared = await prepareConfigPolicy({ root: app, directory, files, defaultPath, selection, cwd: root, sdkDir: sdk });
   process.env.OMP_MANAGER_CONFIG_SLOT_MANIFEST = JSON.stringify(prepared.slotManifest);
-  return { directory, settings: await Settings.loadIsolated({ cwd: root, agentDir: dirs.getAgentDir(), configFiles: prepared.configFiles, overrides }) };
+  const settings = await Settings.loadIsolated({ cwd: root, agentDir: dirs.getAgentDir(), configFiles: prepared.configFiles, overrides });
+  assert.equal(lookup('task.workerThreads').get(settings), 0, 'the final guard keeps managed subagents with their process-local authorization state');
+  return { directory, settings };
 }
 const assigned = await save('assigned', 'temperature: 0.2\nmodelRoles:\n  default: paid-provider/must-never-select\n  task: mock/second\n', {
   'AGENTS.md': 'SETUP_AGENT_A: Keep the session offline.',
@@ -107,6 +109,7 @@ await mkdir(path.join(externalSkills, 'outside'), { recursive: true });
 await writeFile(path.join(externalSkills, 'outside', 'SKILL.md'), '---\nname: native-outside\ndescription: Existing native custom directory\n---\nOutside the selected app setup');
 await writeFile(path.join(dirs.getAgentDir(), 'config.yml'), Bun.YAML.stringify({
   temperature: 0.1, topK: 3, compaction: { enabled: false }, retry: { enabled: false },
+  task: { workerThreads: 4 },
   skills: { customDirectories: [externalSkills] }, modelRoles: { nativeFixtureAlias: 'mock/first' },
 }));
 const preparedRoot = await managedSettings([fallback], fallback, { source: 'model', path: assigned });
@@ -478,7 +481,7 @@ try {
   assert.ok(!(await settlePolicy()).error);
 
   await writeFile(assignmentFile, '[]');
-  await session.extensionRunner.emit({ type: 'before_agent_start', prompt: 'offline', systemPrompt: session.agent.state.systemPrompt });
+  await session.extensionRunner.emit({ type: 'before_agent_start', reason: 'prompt', prompt: 'offline', systemPrompt: session.agent.state.systemPrompt });
   assert.equal(policy.snapshot().source, 'default', 'safe native boundary reloads changed persisted assignments');
   assert.equal(value('temperature'), 0.4);
   assert.equal(value('topP'), 0.6);
@@ -487,6 +490,7 @@ try {
   assert.equal(policy.snapshot().source, 'default', 'changing the global default never changes existing sessions');
   assert.equal(value('temperature'), 0.4);
   assert.equal(value('topP'), 0.6);
+  assert.equal(value('task.workerThreads'), 0, 'native settings reloads retain the main-thread subagent guard');
   process.env.OMP_MANAGER_CONFIG_DEFAULT = '';
   process.env.OMP_MANAGER_CONFIG_FILES = '[]';
   let freshPolicy, freshCtx;

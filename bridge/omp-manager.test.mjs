@@ -38,10 +38,12 @@ test('cancelled native text and Ask answers stay undefined rather than becoming 
 });
 test('rich answers retain native question identity and enforce selection rules', () => {
   const request = { method: 'askDialog', questions: [{ id: 'design', question: 'Design?', options: [{label:'Simple'},{label:'Complex'}] }] };
-  const answer = nativeAnswer(request, { kind:'submit', results:[{id:'design',question:'forged',options:['forged'],selectedOptions:['Simple'],note:'Keep it auditable'}] });
+  const answer = nativeAnswer(request, { kind:'submit', results:[{id:'design',question:'forged',options:['forged'],selectedOptions:['Simple'],note:'Keep it auditable',noteOption:'Simple'}] });
   assert.equal(answer.results[0].question, 'Design?');
   assert.deepEqual(answer.results[0].options, ['Simple','Complex']);
   assert.equal(answer.results[0].note, 'Keep it auditable');
+  assert.equal(answer.results[0].noteOption, 'Simple');
+  assert.throws(() => nativeAnswer(request, {kind:'submit',results:[{id:'design',selectedOptions:['Simple'],note:'Forged',noteOption:'Complex'}]}), /note option/);
   assert.throws(() => nativeAnswer(request, {kind:'submit',results:[{id:'different',selectedOptions:['Simple']}]}));
   assert.throws(() => nativeAnswer(request, {kind:'submit',results:[{id:'design',selectedOptions:['Simple','Complex']}]}));
   assert.throws(() => nativeAnswer(request, {kind:'submit',results:[{id:'design',selectedOptions:['Simple','Simple']}]}));
@@ -137,6 +139,7 @@ test('flat Manager schema covers every canonical action and preserves explicit v
     {action:'transcript',instanceId:'owned-b',subagentId:'child'},
     {action:'keys',instanceId:'owned-b',generation:0,data:'',sessionId:null},
     {action:'respond',instanceId:'owned-b',requestId:'decision',generation:0,response:false},
+    {action:'respond',instanceId:'owned-b',requestId:'form',generation:0,response:{data:{design:'small',count:2,features:['logs','metrics']},notes:[{name:'features',question:'Features?',option:'Metrics',value:'metrics',text:'Human note'}]}},
     {action:'subscribe',instanceId:'owned-b',enabled:false},
     {action:'request_human',instanceId:'owned-b',reason:'Need context',requestId:'decision'},
   ];
@@ -158,6 +161,9 @@ test('flat Manager schema covers every canonical action and preserves explicit v
     {action:'keys',instanceId:'b',generation:-1,data:''},
     {action:'keys',instanceId:'b',generation:1.5,data:''},
     {action:'respond',instanceId:'b',requestId:'r',generation:0,response:{kind:'submit',results:[{id:'q',selectedOptions:[],question:'forged'}]}},
+    {action:'respond',instanceId:'b',requestId:'r',generation:0,response:{data:{field:true}}},
+    {action:'respond',instanceId:'b',requestId:'r',generation:0,response:{data:{field:'value'},timedOut:true}},
+    {action:'respond',instanceId:'b',requestId:'r',generation:0,response:{srsAnswer:{id:'q',selectedOptions:['A']}}},
   ]) assert.throws(() => schema.parse(call));
   for (const call of [{action:'list',instanceId:'b'}, {action:'screen',instanceId:'b',message:'wrong action'},
     {action:'send',instanceId:'b'}, {action:'subscribe',instanceId:'b'}]) {

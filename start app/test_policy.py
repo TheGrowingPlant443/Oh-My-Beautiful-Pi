@@ -75,13 +75,20 @@ class PolicyTests(unittest.TestCase):
 
     def test_installation_snapshot_is_a_fresh_copy_of_the_latest_choice(self):
         first = self.policy.installation()
-        self.assertEqual(first, {"installed_mode": True, "selected_packages": DEFAULT_PACKAGES})
+        default = {"installed_mode": True, "selected_packages": DEFAULT_PACKAGES, "keyboard_layout": "default"}
+        self.assertEqual(first, default)
         first["selected_packages"].clear()
         first["installed_mode"] = False
-        self.assertEqual(self.policy.installation(), {"installed_mode": True, "selected_packages": DEFAULT_PACKAGES})
-        self.policy.replace({**self.policy.snapshot(), "selected_packages": ["ssh"]})
-        self.assertEqual(self.policy.installation(), {"installed_mode": True, "selected_packages": ["ssh"]})
-        self.assertEqual(first, {"installed_mode": False, "selected_packages": []})
+        self.assertEqual(self.policy.installation(), default)
+        self.policy.replace({**self.policy.snapshot(), "selected_packages": ["ssh"], "keyboard_layout": "dk"})
+        self.assertEqual(self.policy.installation(),
+                         {"installed_mode": True, "selected_packages": ["ssh"], "keyboard_layout": "dk"})
+        self.assertEqual(Policy(self.policy.directory).installation()["keyboard_layout"], "dk")
+        self.assertEqual(first, {"installed_mode": False, "selected_packages": [], "keyboard_layout": "default"})
+        for layout in ("us", "dk-mac", "", None, ["dk"]):
+            with self.subTest(layout=layout), self.assertRaisesRegex(ValueError, "keyboard layout"):
+                self.policy.replace({**self.policy.snapshot(), "keyboard_layout": layout})
+        self.assertEqual(self.policy.installation()["keyboard_layout"], "dk")
 
     def test_legacy_policy_defaults_to_installed_without_losing_choices(self):
         folder = str(self.folder.resolve())
@@ -90,7 +97,7 @@ class PolicyTests(unittest.TestCase):
         self.policy.deny("folder", "/private", "not shared")
         history = self.policy.events()
         legacy = self.policy.snapshot()
-        for key in ("installed_mode", "selected_packages", "hide_language_server_denials"):
+        for key in ("installed_mode", "selected_packages", "keyboard_layout", "hide_language_server_denials"):
             del legacy[key]
         legacy.update(folders=[{"path": folder, "write": False}], programs=[f"/nix/store/{'a' * 32}-tool/bin/tool"],
                       websites=["https://example.com"], credential_origins=["https://example.com"],
@@ -101,6 +108,7 @@ class PolicyTests(unittest.TestCase):
         snapshot = migrated.snapshot()
         self.assertTrue(snapshot.pop("installed_mode"))
         self.assertEqual(snapshot.pop("selected_packages"), DEFAULT_PACKAGES)
+        self.assertEqual(snapshot.pop("keyboard_layout"), "default")
         self.assertTrue(snapshot.pop("hide_language_server_denials"))
         self.assertEqual(snapshot, legacy)
         self.assertEqual(migrated.events(), history)
@@ -110,7 +118,7 @@ class PolicyTests(unittest.TestCase):
         # An explicit saved choice, including no optional packages, is never replaced by the defaults.
         self.policy.save("policy.json", {**legacy, "selected_packages": []})
         self.assertEqual(Policy(self.policy.directory).installation(),
-                         {"installed_mode": True, "selected_packages": []})
+                         {"installed_mode": True, "selected_packages": [], "keyboard_layout": "default"})
 
     def test_installation_and_history_view_changes_keep_authority_and_history(self):
         self.policy.deny("program", "gopls", "Program is not selected")

@@ -4,6 +4,8 @@ Mount socket_path.parent and ca_path, never state_dir (which contains the CA key
 The container must have --network=none and no other host sockets. Certificate-
 pinned applications fail closed; arbitrary TCP and non-WebSocket HTTP upgrades are
 not supported (WebSockets to allowed origins are). Optional host keyring credentials are scoped to selected origins.
+Listed websites may also reach internal (private-use) addresses, such as hosts behind a VPN connected on the host;
+loopback, link-local and every other non-public destination stay blocked.
 """
 
 import asyncio
@@ -15,6 +17,7 @@ from pathlib import Path
 import re
 import socket
 import stat
+import subprocess
 import sys
 import threading
 from urllib.parse import urljoin, urlsplit
@@ -232,18 +235,69 @@ def _public_address(value):
     return True
 
 
-async def _resolve_public(host, port):
+def _internal_address(value):
+    """A private-use unicast address: never loopback, link-local, multicast or transition forms."""
+    address = ipaddress.ip_address(value)
+    if (address.is_global or address.is_loopback or address.is_link_local or address.is_multicast
+            or address.is_unspecified or address.is_reserved):
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        return not (address.ipv4_mapped or address.sixtofour or address.teredo
+                    or address in ipaddress.ip_network("64:ff9b::/96"))
+    return address not in ipaddress.ip_network("0.0.0.0/8")
+
+
+async def _addresses(host, port):
     answers = await asyncio.get_running_loop().getaddrinfo(
         host, port, type=socket.SOCK_STREAM)
     addresses = [answer[4][0] for answer in answers]
-    if not addresses or not all(_public_address(address) for address in addresses):
-        raise ValueError("Destination resolves to a non-public address")
+    if not addresses:
+        raise ValueError("Destination has no address")
+    return addresses
+
+
+async def _resolve(host, port, internal):
+    """The first vetted address; every answer must be public, or with internal also private-use."""
+    addresses = await _addresses(host, port)
+    if not all(_public_address(address) or (internal and _internal_address(address)) for address in addresses):
+        raise ValueError("Destination resolves to a non-public address" if not internal else
+                         "Destination resolves to a non-public address outside private networks")
     return addresses[0]
 
 
-# Fixed absolute path: never a PATH-resolved binary on macOS.
+# Fixed absolute paths: never PATH-resolved binaries on macOS.
 _KEYCHAIN = "/usr/bin/security"
+_SYSTEM_KEYCHAIN = "/Library/Keychains/System.keychain"
 _PLATFORM = sys.platform
+
+
+def _authority_certificates(pem):
+    """PEM CA certificates from pem (leaf, malformed and non-CA entries dropped)."""
+    from cryptography import x509
+    found = []
+    for block in re.findall(rb"-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----", pem):
+        try:
+            certificate = x509.load_pem_x509_certificate(block)
+            if certificate.extensions.get_extension_for_class(x509.BasicConstraints).value.ca:
+                found.append(block)
+        except (ValueError, x509.ExtensionNotFound):
+            continue
+    return found
+
+
+def write_upstream_trust(path):
+    """Public roots plus the CA certificates in the Mac System keychain."""
+    import certifi
+    output = subprocess.run([_KEYCHAIN, "find-certificate", "-a", "-p", _SYSTEM_KEYCHAIN], env={},
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=True).stdout
+    bundle = Path(certifi.where()).read_bytes().rstrip() + b"\n" + b"\n".join(_authority_certificates(output)) + b"\n"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(bundle)
+    os.replace(temporary, path)
+    return path
 
 
 def _keyring_command(target):
@@ -351,6 +405,10 @@ class _Guard:
         if requester and requester in snapshot.get("header_dependencies", []):
             return None
         return "Origin is not allowed"
+
+    def _internal(self, target):
+        """Listed websites may use internal addresses; other grants stay public."""
+        return covering_site(target, self.policy.snapshot()) is not None
 
     def _owner(self, target, snapshot):
         """The approved site whose dependency set grants target, if any."""
@@ -461,9 +519,9 @@ class _Guard:
         if target not in self.policy.snapshot().get("credential_origins", []):
             return
         try:
-            await _resolve_public(flow.request.host, flow.request.port)
+            await _resolve(flow.request.host, flow.request.port, self._internal(target))
         except (ValueError, OSError):
-            self._deny(flow, target, "Destination is not publicly reachable")
+            self._deny(flow, target, "Destination is not reachable for this website")
             return
         reason = self._allowed(target)
         if reason:
@@ -501,7 +559,7 @@ class _Guard:
             reason = self._allowed(target, self.authorized[data.client.id][target])
             if reason:
                 raise ValueError(reason)
-            address = await _resolve_public(host, port)
+            address = await _resolve(host, port, self._internal(target))
             # Pin the resolved IP: mitmproxy must not perform a second DNS lookup.
             data.server.address = (address, port)
             data.server.sni = host
@@ -699,6 +757,14 @@ class NetworkGateway:
                                 next_layer.NextLayer(), tlsconfig.TlsConfig(),
                                 _Guard(self.policy), self)
         self._master.options.update(connection_strategy="lazy")
+        if _PLATFORM == "darwin":
+            try:
+                trust = await asyncio.to_thread(write_upstream_trust, self.state_dir / "upstream-ca.pem")
+                self._master.options.update(ssl_verify_upstream_trusted_ca=str(trust))
+            except (OSError, subprocess.SubprocessError) as error:
+                # Public sites still verify against the public roots.
+                print(f"System keychain certificates unavailable, using public roots only: {error}",
+                      file=sys.stderr, flush=True)
         try:
             await self._master.run()
         finally:

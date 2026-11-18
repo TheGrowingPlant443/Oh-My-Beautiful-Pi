@@ -1,4 +1,4 @@
-"""Local fixtures only: production never offers a private-address bypass."""
+"""Local fixtures only: production never offers a private-address bypass outside a host VPN tunnel."""
 
 import asyncio
 import base64
@@ -262,10 +262,10 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
         guard = network._Guard(policy)
         guard.tunnels["client"] = "https://example.test"
         selected = flow("https://example.test/private", tls=True)
-        with (patch.object(network, "_resolve_public", return_value="93.184.216.34") as resolve,
+        with (patch.object(network, "_resolve", return_value="93.184.216.34") as resolve,
               patch.object(network, "_lookup_authorization", return_value="Bearer host-fixture") as lookup):
             await guard.requestheaders(selected)
-            resolve.assert_awaited_once_with("example.test", 443)
+            resolve.assert_awaited_once_with("example.test", 443, True)
             lookup.assert_awaited_once_with("https://example.test")
             self.assertEqual(selected.request.headers["Authorization"], "Bearer host-fixture")
             lookup.reset_mock()
@@ -289,7 +289,7 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
         guard.tunnels["client"] = "https://example.test"
         for error in (ValueError("fixture-secret"), OSError("fixture-secret"), TimeoutError()):
             selected = flow("https://example.test/", tls=True)
-            with (patch.object(network, "_resolve_public", return_value="93.184.216.34"),
+            with (patch.object(network, "_resolve", return_value="93.184.216.34"),
                   patch.object(network, "_lookup_authorization", side_effect=error)):
                 await guard.requestheaders(selected)
             self.assertEqual(selected.response.status_code, 502)
@@ -304,7 +304,7 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
         guard = network._Guard(policy)
         guard.tunnels["client"] = "https://example.test"
         selected = flow("https://example.test/", tls=True)
-        with (patch.object(network, "_resolve_public", side_effect=ValueError("private")),
+        with (patch.object(network, "_resolve", side_effect=ValueError("private")),
               patch.object(network, "_lookup_authorization") as lookup):
             await guard.requestheaders(selected)
             lookup.assert_not_called()
@@ -428,7 +428,7 @@ class KeychainTests(unittest.IsolatedAsyncioTestCase):
         guard = network._Guard(policy)
         guard.tunnels["client"] = "https://example.test"
         selected = flow("https://example.test/", tls=True)
-        with patch.object(network, "_resolve_public", return_value="93.184.216.34"):
+        with patch.object(network, "_resolve", return_value="93.184.216.34"):
             await guard.requestheaders(selected)
         self.assertEqual((selected.response.status_code, selected.response.content),
                          (502, b"Host credential unavailable.\n"))
@@ -441,7 +441,7 @@ class KeychainTests(unittest.IsolatedAsyncioTestCase):
         guard = network._Guard(policy)
         guard.tunnels["client"] = "https://example.test"
         selected = flow("https://example.test/", tls=True)
-        with patch.object(network, "_resolve_public", return_value="93.184.216.34"):
+        with patch.object(network, "_resolve", return_value="93.184.216.34"):
             pending = asyncio.create_task(guard.requestheaders(selected))
             for _ in range(500):
                 if (self.root / "started").exists():
@@ -469,7 +469,7 @@ class DNSTests(unittest.IsolatedAsyncioTestCase):
                    for address in ("93.184.216.34", "127.0.0.1")]
         with patch.object(asyncio.get_running_loop(), "getaddrinfo", return_value=answers):
             with self.assertRaises(ValueError):
-                await network._resolve_public("fixture.test", 80)
+                await network._resolve("fixture.test", 80, True)
 
     async def test_dns_pin_and_live_revocation(self):
         policy = Policy(["http://fixture.test"])
@@ -477,14 +477,14 @@ class DNSTests(unittest.IsolatedAsyncioTestCase):
         guard._check_request(flow("http://fixture.test/"))
         server = SimpleNamespace(address=("fixture.test", 80), error=None, sni=None)
         data = SimpleNamespace(server=server, client=SimpleNamespace(id="client"))
-        with patch.object(network, "_resolve_public", return_value="93.184.216.34") as resolver:
+        with patch.object(network, "_resolve", return_value="93.184.216.34") as resolver:
             await guard.server_connect(data)
             self.assertEqual(server.address, ("93.184.216.34", 80))
             self.assertEqual(server.sni, "fixture.test")
-            resolver.assert_awaited_once_with("fixture.test", 80)
+            resolver.assert_awaited_once_with("fixture.test", 80, True)
         policy.values["websites"] = []
         server.address = ("fixture.test", 80)
-        with patch.object(network, "_resolve_public") as resolver:
+        with patch.object(network, "_resolve") as resolver:
             await guard.server_connect(data)
             resolver.assert_not_called()
         self.assertEqual(server.error, "Website destination denied")
@@ -492,17 +492,49 @@ class DNSTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_localhost_denied_without_test_bypass(self):
         with self.assertRaises(ValueError):
-            await network._resolve_public("127.0.0.1", 80)
+            await network._resolve("127.0.0.1", 80, True)
 
     async def test_raw_connection_has_no_authorized_request(self):
         policy = Policy(["https://fixture.test"])
         guard = network._Guard(policy)
         data = SimpleNamespace(server=SimpleNamespace(address=("fixture.test", 443), error=None),
                                client=SimpleNamespace(id="unknown"))
-        with patch.object(network, "_resolve_public") as resolver:
+        with patch.object(network, "_resolve") as resolver:
             await guard.server_connect(data)
             resolver.assert_not_called()
         self.assertIsNotNone(data.server.error)
+
+
+class InternalAddressTests(unittest.IsolatedAsyncioTestCase):
+    """Listed websites may reach private-use addresses; nothing else may."""
+
+    def setUp(self):
+        self.policy = Policy(["https://internal.example.test"])
+        self.guard = network._Guard(self.policy)
+
+    async def connect(self, target, addresses):
+        """Connect through the guard; the pinned address, or None when denied."""
+        parsed = network.urlsplit(target)
+        self.guard.tunnels["client"] = target
+        self.guard._check_request(flow(f"{target}/path", tls=True))
+        server = SimpleNamespace(address=(parsed.hostname, 443), error=None, sni=None)
+        with patch.object(network, "_addresses", AsyncMock(return_value=addresses)):
+            await self.guard.server_connect(SimpleNamespace(server=server, client=SimpleNamespace(id="client")))
+        return None if server.error else server.address[0]
+
+    async def test_listed_sites_reach_internal_but_never_loopback_or_link_local(self):
+        self.assertEqual(await self.connect("https://internal.example.test", ["10.1.2.3"]), "10.1.2.3")
+        self.assertEqual(await self.connect("https://api.internal.example.test", ["fd00::7"]), "fd00::7")
+        self.assertEqual(await self.connect("https://internal.example.test", ["93.184.216.34", "10.1.2.3"]),
+                         "93.184.216.34")
+        for addresses in (["127.0.0.1"], ["10.1.2.3", "127.0.0.1"], ["169.254.169.254"], ["::1"], ["fe80::1"],
+                          ["0.0.0.1"], ["::ffff:10.1.2.3"]):
+            with self.subTest(addresses=addresses):
+                self.assertIsNone(await self.connect("https://internal.example.test", addresses))
+        # Allow all network traffic opens public websites, never internal addresses.
+        self.policy.values["allow_all_network"] = True
+        self.assertIsNone(await self.connect("https://intranet.test", ["10.1.2.3"]))
+        self.assertEqual(await self.connect("https://intranet.test", ["93.184.216.34"]), "93.184.216.34")
 
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
@@ -654,12 +686,12 @@ class GatewayIntegrationTests(unittest.TestCase):
         self.server_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.server_thread.start()
 
-        async def fixture_resolution(host, port):
+        async def fixture_resolution(host, port, internal):
             if host != "fixture.test" or port != self.httpd.server_port:
                 raise ValueError("Unexpected test destination")
             return "127.0.0.1"
 
-        self.resolver = patch.object(network, "_resolve_public", side_effect=fixture_resolution)
+        self.resolver = patch.object(network, "_resolve", side_effect=fixture_resolution)
         self.resolver.start()
         self.addCleanup(self.resolver.stop)
         self.gateway = network.NetworkGateway(self.policy, Path(self.directory.name) / "network")
@@ -717,7 +749,7 @@ class GatewayIntegrationTests(unittest.TestCase):
         self.assertEqual(self.keepalive_request(sock, scheme), (200, b"fixture response"))
         # A DNS change cannot move an already vetted connection. More than five
         # requests also catches exhausting mitmproxy's per-address connection cap.
-        with patch.object(network, "_resolve_public", side_effect=ValueError("DNS changed to private")) as resolve:
+        with patch.object(network, "_resolve", side_effect=ValueError("DNS changed to private")) as resolve:
             for index in range(1, 9):
                 self.assertEqual(self.keepalive_request(sock, scheme, f"/asset-{index}"),
                                  (200, b"fixture response"))
@@ -743,7 +775,7 @@ class GatewayIntegrationTests(unittest.TestCase):
         self.policy.values["websites"] = [f"https://fixture.test:{port}", f"https://other.test:{port}"]
         sock = self.open_socket("https")
         self.assertEqual(self.keepalive_request(sock, "https"), (200, b"fixture response"))
-        with patch.object(network, "_resolve_public") as resolve:
+        with patch.object(network, "_resolve") as resolve:
             self.assertEqual(self.keepalive_request(sock, "https", "/escape", host="other.test"),
                              (403, b"Website access denied by launcher policy.\n"))
             resolve.assert_not_awaited()
